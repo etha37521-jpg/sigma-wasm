@@ -27,19 +27,20 @@ Before diving into the code, let's understand how the entire system fits togethe
 ```mermaid
 graph TB
     subgraph Development["Development Environment"]
-        RustCode["Rust Source Code<br/>(src/lib.rs, world/, engine/)"]
-        TypeScriptCode["TypeScript Source<br/>(src/main.ts, types.ts)"]
+        RustWorkspace["Rust Workspace<br/>(wasm-astar/, wasm-preprocess/)"]
+        TypeScriptCode["TypeScript Source<br/>(src/main.ts, routes/, wasm/)"]
+        Pages["HTML Pages<br/>(pages/astar.html, pages/preprocess.html)"]
     end
     
     subgraph Build["Build Process"]
-        RustBuild["Cargo Build<br/>wasm32-unknown-unknown"]
+        RustBuild["Cargo Build Workspace<br/>wasm32-unknown-unknown"]
         WasmBindgen["wasm-bindgen<br/>Generate JS Bindings"]
-        WasmOpt["wasm-opt<br/>Optimize Binary"]
-        ViteBuild["Vite Build<br/>Bundle Frontend"]
+        WasmOpt["wasm-opt<br/>Optimize Binaries"]
+        ViteBuild["Vite Build<br/>Multi-Page Bundle"]
     end
     
     subgraph Docker["Docker Multi-Stage"]
-        RustBuilder["Stage 1: rust-builder<br/>Compile WASM"]
+        RustBuilder["Stage 1: rust-builder<br/>Compile All WASM"]
         NodeBuilder["Stage 2: node-builder<br/>Build Frontend"]
         Runtime["Stage 3: runtime<br/>nginx:alpine"]
     end
@@ -47,92 +48,167 @@ graph TB
     subgraph Runtime["Production Runtime"]
         Nginx["Nginx Server<br/>Port Binding"]
         StaticFiles["Static Files<br/>/usr/share/nginx/html"]
-        WasmModule["WASM Module<br/>wasm_astar_bg.wasm"]
+        WasmModules["WASM Modules<br/>(wasm_astar_bg.wasm,<br/>wasm_preprocess_bg.wasm)"]
     end
     
     subgraph Client["Browser Client"]
-        HTML["index.html"]
-        JS["Bundled JavaScript<br/>main.ts"]
+        Router["Client Router<br/>main.ts"]
+        RouteHandlers["Route Handlers<br/>(astar.ts, preprocess.ts)"]
+        WasmLoader["WASM Loader<br/>loader.ts"]
         Canvas["HTML5 Canvas<br/>Rendering"]
     end
     
-    RustCode --> RustBuild
+    RustWorkspace --> RustBuild
     RustBuild --> WasmBindgen
     WasmBindgen --> WasmOpt
     WasmOpt --> RustBuilder
     TypeScriptCode --> ViteBuild
+    Pages --> ViteBuild
     ViteBuild --> NodeBuilder
     RustBuilder --> NodeBuilder
     NodeBuilder --> Runtime
     Runtime --> Nginx
     Nginx --> StaticFiles
-    StaticFiles --> HTML
-    HTML --> JS
-    JS --> WasmModule
-    WasmModule --> Canvas
+    StaticFiles --> Router
+    Router --> RouteHandlers
+    RouteHandlers --> WasmLoader
+    WasmLoader --> WasmModules
+    WasmModules --> Canvas
     
-    style RustCode fill:#ce412b
+    style RustWorkspace fill:#ce412b
     style TypeScriptCode fill:#3178c6
     style Nginx fill:#009639
-    style WasmModule fill:#654ff0
+    style WasmModules fill:#654ff0
+    style Router fill:#f7df1e
 ```
 
 ### Request Flow
 
 When a user visits your deployed application, here's what happens:
 
-1. **Browser Request**: User navigates to `https://your-app.onrender.com`
+1. **Browser Request**: User navigates to `https://your-app.onrender.com/astar` or `/preprocess`
 2. **Render.com Load Balancer**: Routes request to your Docker container
 3. **Nginx**: Receives request on dynamically-bound port (set via `$PORT` environment variable)
-4. **Static File Serving**: Nginx serves `index.html` from `/usr/share/nginx/html`
-5. **JavaScript Execution**: Browser loads and executes bundled TypeScript code
-6. **WASM Initialization**: JavaScript loads and initializes the WebAssembly module
-7. **Rust Execution**: WASM module runs Rust code (A* pathfinding algorithm)
-8. **Canvas Rendering**: Rust calls back to JavaScript to render on HTML5 Canvas
-9. **User Interaction**: Keyboard/mouse events flow from JavaScript → WASM → Rust → back to JavaScript for rendering
+4. **Static File Serving**: Nginx serves the appropriate HTML page (`pages/astar.html` or `pages/preprocess.html`) from `/usr/share/nginx/html`
+5. **JavaScript Execution**: Browser loads and executes bundled TypeScript code (`main.ts`)
+6. **Client-Side Routing**: Router in `main.ts` detects the URL path and loads the appropriate route handler
+7. **Route Handler Initialization**: Route handler (e.g., `routes/astar.ts` or `routes/preprocess.ts`) initializes
+8. **WASM Module Loading**: Route handler uses shared WASM loader to load and validate the appropriate WASM module
+9. **WASM Initialization**: JavaScript initializes the WebAssembly module with type-safe validation
+10. **Rust Execution**: WASM module runs Rust code (A* pathfinding, image preprocessing, etc.)
+11. **Canvas Rendering**: Rust calls back to JavaScript to render on HTML5 Canvas or update DOM
+12. **User Interaction**: Keyboard/mouse events flow from JavaScript → WASM → Rust → back to JavaScript for rendering
 
 ### Key Architectural Decisions
 
 🧠 **Concept Break**: Why This Architecture?
 
-- **Rust for Performance**: The A* pathfinding algorithm benefits from Rust's zero-cost abstractions and memory safety
+- **Rust for Performance**: Computational algorithms (A* pathfinding, image processing) benefit from Rust's zero-cost abstractions and memory safety
 - **WASM for Browser Execution**: Compiling Rust to WebAssembly allows near-native performance in the browser
 - **TypeScript for Type Safety**: TypeScript ensures correct communication between JavaScript and WASM
+- **Multi-Endpoint Architecture**: Each endpoint showcases its own WASM module, enabling modularity and easy expansion
+- **Client-Side Routing**: Simple router loads endpoint-specific code only when needed, reducing initial bundle size
+- **Workspace Structure**: Rust workspace enables multiple WASM crates to share dependencies and build configuration
 - **Multi-Stage Docker**: Separates build dependencies from runtime, resulting in a tiny final image (~40MB)
 - **Nginx for Production**: Lightweight, battle-tested web server with excellent performance characteristics
 - **Render.com for Simplicity**: Platform handles SSL, scaling, and infrastructure management
 
 ---
 
+## Multi-Endpoint Architecture
+
+This application uses a multi-endpoint architecture where each endpoint showcases its own specialized WASM module. This design enables modularity, code splitting, and easy addition of new endpoints.
+
+### Architecture Overview
+
+Each endpoint follows a consistent pattern:
+
+1. **Rust Crate**: A workspace member crate (e.g., `wasm-astar`, `wasm-preprocess`) containing the WASM module logic
+2. **HTML Page**: A dedicated page in `pages/` directory (e.g., `pages/astar.html`, `pages/preprocess.html`)
+3. **Route Handler**: TypeScript module in `src/routes/` that initializes the endpoint's WASM module
+4. **Shared Utilities**: Common WASM loading and type definitions in `src/wasm/`
+
+### Client-Side Routing
+
+The application uses a simple client-side router in `src/main.ts`:
+
+```typescript:src/main.ts
+import { init as initAstar } from './routes/astar';
+import { init as initPreprocess } from './routes/preprocess';
+
+const routes: Map<string, RouteHandler> = new Map();
+routes.set('/astar', initAstar);
+routes.set('/preprocess', initPreprocess);
+routes.set('/', initAstar); // Default route
+```
+
+When a user navigates to a URL, the router:
+1. Extracts the pathname from `window.location.pathname`
+2. Looks up the corresponding route handler
+3. Calls the handler's `init()` function
+4. The handler loads and initializes the appropriate WASM module
+
+### Benefits of This Architecture
+
+- **Modularity**: Each endpoint is self-contained and independent
+- **Code Splitting**: Only the WASM module for the current endpoint is loaded
+- **Easy Expansion**: Adding a new endpoint requires minimal changes
+- **Type Safety**: Shared utilities ensure consistent, type-safe WASM loading
+- **Maintainability**: Clear separation of concerns makes the codebase easier to understand and modify
+
+### Current Endpoints
+
+- **`/astar`**: A* pathfinding algorithm visualization with interactive tile-based world
+- **`/preprocess`**: Image and text preprocessing utilities for ML/AI workflows
+
+💡 **Tip**: This architecture is inspired by the pattern of using WASM for efficient, low-level computations (like preprocessing for client-side LLMs) while keeping the main application logic in TypeScript.
+
+---
+
 ## Backend (Rust)
 
-The Rust backend is the computational heart of this application. It implements an A* pathfinding algorithm that finds optimal paths through a randomly generated tile-based world.
+The Rust backend consists of multiple WASM modules, each compiled as a separate crate in a Cargo workspace. This architecture enables each endpoint to have its own specialized WASM module while sharing common dependencies and build configuration.
 
-### Project Structure
+### Workspace Structure
 
-The Rust codebase is organized into logical modules:
+The Rust codebase is organized as a Cargo workspace with multiple member crates:
 
 ```
-src/
-├── lib.rs          # Main entry point, WASM bindings
-├── world/
-│   ├── mod.rs      # World state and A* algorithm
-│   └── tile.rs     # Tile data structure
-├── engine/
-│   └── mod.rs      # Engine state, input handling, FPS tracking
-├── browser/
-│   └── mod.rs      # Browser API bindings
-└── utils/
-    └── mod.rs      # Utility functions (logging, random)
+Cargo.toml              # Workspace root configuration
+wasm-astar/
+├── Cargo.toml          # A* pathfinding crate configuration
+└── src/
+    ├── lib.rs          # Main entry point, WASM bindings
+    ├── world/
+    │   ├── mod.rs      # World state and A* algorithm
+    │   └── tile.rs     # Tile data structure
+    ├── engine/
+    │   └── mod.rs      # Engine state, input handling, FPS tracking
+    ├── browser/
+    │   └── mod.rs      # Browser API bindings
+    └── utils/
+        └── mod.rs      # Utility functions (logging, random)
+wasm-preprocess/
+├── Cargo.toml          # Preprocessing crate configuration
+└── src/
+    └── lib.rs          # Image and text preprocessing functions
 ```
+
+🧠 **Concept Break**: Why a Workspace?
+
+- **Shared Dependencies**: All crates share the same `wasm-bindgen` version and build settings
+- **Unified Build**: Build all WASM modules with a single command
+- **Dependency Caching**: Cargo caches dependencies across workspace members
+- **Version Consistency**: Ensures all crates use compatible dependency versions
+- **Easy Expansion**: Adding a new WASM module is as simple as creating a new crate
 
 ### Core Concepts
 
 #### 1. WebAssembly Bindings with `wasm-bindgen`
 
-The project uses `wasm-bindgen` to create seamless interoperability between Rust and JavaScript. Here's how it works:
+Each workspace crate uses `wasm-bindgen` to create seamless interoperability between Rust and JavaScript. Here's an example from the A* pathfinding module:
 
-```rust:src/lib.rs
+```rust:wasm-astar/src/lib.rs
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -142,13 +218,30 @@ pub fn wasm_init(debug: i32, render_interval_ms: i32, window_width: u32, window_
 }
 ```
 
-⚙️ **Under the Hood**: The `#[wasm_bindgen]` attribute macro generates JavaScript bindings at compile time. When you call `wasm_init()` from TypeScript, it's actually calling a generated JavaScript function that marshals arguments, calls the WASM function, and marshals return values.
+And from the preprocessing module:
+
+```rust:wasm-preprocess/src/lib.rs
+use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen]
+pub fn preprocess_image(
+    image_data: &[u8],
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> Result<Vec<u8>, JsValue> {
+    // ... image processing code
+}
+```
+
+⚙️ **Under the Hood**: The `#[wasm_bindgen]` attribute macro generates JavaScript bindings at compile time. When you call these functions from TypeScript, you're actually calling generated JavaScript functions that marshal arguments, call the WASM function, and marshal return values.
 
 #### 2. Global State with `LazyLock` and `Mutex`
 
 Rust's ownership system prevents global mutable state by default. For WASM applications that need to maintain state across function calls, we use `LazyLock` (Rust 2021) with `Mutex`:
 
-```rust:src/lib.rs
+```rust:wasm-astar/src/lib.rs
 use std::sync::{LazyLock, Mutex};
 
 static WORLD_STATE: LazyLock<Mutex<WorldState>> = 
@@ -164,9 +257,9 @@ static ENGINE_STATE: LazyLock<Mutex<EngineState>> =
 
 #### 3. The A* Pathfinding Algorithm
 
-The core algorithm lives in `src/world/mod.rs`. A* is an informed search algorithm that finds the shortest path between two points:
+The core algorithm lives in `wasm-astar/src/world/mod.rs`. A* is an informed search algorithm that finds the shortest path between two points:
 
-```rust:src/world/mod.rs
+```rust:wasm-astar/src/world/mod.rs
 pub fn calc_astar(&mut self) {
     // Open set: nodes to be evaluated
     // Closed set: nodes already evaluated
@@ -177,11 +270,31 @@ pub fn calc_astar(&mut self) {
 
 💡 **Tip**: A* is optimal and complete—it always finds the shortest path if one exists, and it's more efficient than Dijkstra's algorithm because it uses a heuristic to guide the search.
 
+#### 3b. Image Preprocessing
+
+The preprocessing module (`wasm-preprocess`) demonstrates another use case for WASM—efficient image and text processing:
+
+```rust:wasm-preprocess/src/lib.rs
+#[wasm_bindgen]
+pub fn preprocess_image(
+    image_data: &[u8],
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> Result<Vec<u8>, JsValue> {
+    // Resize image using Rust's image crate
+    // Returns processed image data
+}
+```
+
+This module showcases how WASM can handle computationally intensive tasks like image resizing, which is common in ML/AI workflows (e.g., preprocessing images for vision models).
+
 #### 4. Calling JavaScript from Rust
 
 Rust code can call JavaScript functions through `wasm-bindgen`:
 
-```rust:src/lib.rs
+```rust:wasm-astar/src/lib.rs
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_name = "js_draw_tile")]
@@ -195,11 +308,11 @@ extern "C" {
 }
 ```
 
-This declares that a JavaScript function `js_draw_tile` exists and can be called from Rust. The actual implementation lives in TypeScript.
+This declares that a JavaScript function `js_draw_tile` exists and can be called from Rust. The actual implementation lives in the TypeScript route handler (`src/routes/astar.ts`).
 
 #### 5. Module Organization
 
-The codebase follows Rust's module system:
+Each workspace crate follows Rust's module system. For example, `wasm-astar`:
 
 - **`lib.rs`**: Main entry point, exports public WASM functions
 - **`world/mod.rs`**: Game world state, tile management, A* algorithm
@@ -207,15 +320,33 @@ The codebase follows Rust's module system:
 - **`browser/mod.rs`**: Wrapper functions for browser APIs
 - **`utils/mod.rs`**: Shared utilities (logging, random number generation)
 
+The `wasm-preprocess` crate has a simpler structure focused on preprocessing functions.
+
 ### Rust Build Configuration
 
-The `Cargo.toml` file defines the project:
+The workspace is defined by the root `Cargo.toml`:
 
 ```toml:Cargo.toml
-[package]
-name = "wasm-astar"
+[workspace]
+members = ["wasm-astar", "wasm-preprocess"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+[profile.release]
+lto = true          # Link-time optimization
+opt-level = 's'     # Optimize for size
+```
+
+Each member crate has its own `Cargo.toml`:
+
+```toml:wasm-astar/Cargo.toml
+[package]
+name = "wasm-astar"
+version.workspace = true
+edition.workspace = true
 
 [lib]
 path = "src/lib.rs"
@@ -224,13 +355,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
-
-[profile.release]
-lto = true          # Link-time optimization
-opt-level = 's'     # Optimize for size
 ```
 
 ⚙️ **Under the Hood**: 
+- **`[workspace]`**: Defines a Cargo workspace with multiple member crates
+- **`members`**: Lists all workspace member crates
+- **`version.workspace = true`**: Inherits version from workspace root
 - **`crate-type = ["cdylib", "rlib"]`**: `cdylib` creates a dynamic library (WASM), `rlib` allows the crate to be used as a dependency
 - **`lto = true`**: Link-time optimization reduces binary size and improves performance
 - **`opt-level = 's'`**: Optimizes for size rather than speed (important for web delivery)
@@ -239,15 +369,81 @@ opt-level = 's'     # Optimize for size
 
 ## Frontend (TypeScript)
 
-The TypeScript frontend orchestrates the entire application lifecycle: loading WASM, handling user input, and rendering to the canvas.
+The TypeScript frontend orchestrates the entire application lifecycle: client-side routing, loading WASM modules, handling user input, and rendering. The architecture is organized into route handlers, shared utilities, and a central router.
+
+### Project Structure
+
+The TypeScript codebase is organized as follows:
+
+```
+src/
+├── main.ts              # Client-side router
+├── routes/
+│   ├── astar.ts         # A* pathfinding route handler
+│   └── preprocess.ts    # Preprocessing route handler
+├── wasm/
+│   ├── loader.ts        # Generic WASM module loader
+│   └── types.ts         # Shared WASM type definitions
+├── types.ts             # Application-specific types
+└── styles.css           # Shared styles
+```
+
+### Client-Side Routing
+
+The application uses a simple client-side router in `src/main.ts`:
+
+```typescript:src/main.ts
+import { init as initAstar } from './routes/astar';
+import { init as initPreprocess } from './routes/preprocess';
+
+const routes: Map<string, RouteHandler> = new Map();
+routes.set('/astar', initAstar);
+routes.set('/preprocess', initPreprocess);
+routes.set('/', initAstar); // Default route
+
+async function route(): Promise<void> {
+  const path = window.location.pathname;
+  let handler = routes.get(path);
+  
+  // Try prefix matching if no exact match
+  if (!handler) {
+    for (const [routePath, routeHandler] of routes.entries()) {
+      if (path.startsWith(routePath) && routePath !== '/') {
+        handler = routeHandler;
+        break;
+      }
+    }
+  }
+  
+  if (handler) {
+    await handler();
+  }
+}
+```
+
+When the page loads, the router:
+1. Reads the current URL pathname
+2. Looks up the corresponding route handler
+3. Calls the handler's `init()` function
+4. The handler loads and initializes the appropriate WASM module
+
+🧠 **Concept Break**: Why Client-Side Routing?
+
+- **Code Splitting**: Each route handler is a separate module, loaded only when needed
+- **Modularity**: Each endpoint is self-contained
+- **Type Safety**: Route handlers use shared utilities for consistent WASM loading
+- **Simple**: No complex routing library needed for this use case
 
 ### Type Safety with Interfaces
 
-Before we even load WASM, we define strict types:
+Shared type definitions live in `src/wasm/types.ts`:
 
-```typescript:src/types.ts
-export interface WasmModule {
+```typescript:src/wasm/types.ts
+export interface WasmModuleBase {
   memory: WebAssembly.Memory;
+}
+
+export interface WasmModuleAstar extends WasmModuleBase {
   wasm_init(debug: number, renderIntervalMs: number, windowWidth: number, windowHeight: number): void;
   tick(elapsedTime: number): void;
   key_down(keyCode: number): void;
@@ -255,16 +451,15 @@ export interface WasmModule {
   mouse_move(x: number, y: number): void;
 }
 
-export interface Layer {
-  ctx: CanvasRenderingContext2D;
-  canvas: HTMLCanvasElement;
-  setSize(width: number, height: number, quality: number): void;
-  clearScreen(): void;
-  drawRect(px: number, py: number, sx: number, sy: number, ch: number, cs: number, cl: number, ca: number): void;
-  drawCircle(px: number, py: number, r: number, ch: number, cs: number, cl: number, ca: number): void;
-  drawText(text: string, fontSize: number, px: number, py: number): void;
+export interface WasmModulePreprocess extends WasmModuleBase {
+  preprocess_image(imageData: Uint8Array, sourceWidth: number, sourceHeight: number, targetWidth: number, targetHeight: number): Uint8Array;
+  preprocess_text(text: string): Uint32Array;
+  normalize_text(text: string): string;
+  get_preprocess_stats(originalSize: number, targetSize: number): PreprocessStats;
 }
 ```
+
+Each WASM module has its own interface extending `WasmModuleBase`, ensuring type safety while allowing module-specific functions.
 
 🧠 **Concept Break**: Why TypeScript?
 
@@ -272,45 +467,44 @@ TypeScript catches errors at compile time that would only surface at runtime in 
 - WASM functions have specific signatures
 - Memory access must be correct
 - Type mismatches cause cryptic runtime errors
+- Multiple WASM modules require clear type boundaries
 
-### WASM Module Initialization
+### Route Handler Initialization
 
-The initialization process is carefully orchestrated:
+Each route handler follows a consistent pattern. Here's the A* pathfinding handler:
 
-```typescript:src/main.ts
-const init = async (): Promise<void> => {
+```typescript:src/routes/astar.ts
+import initWasm from '../../pkg/wasm_astar/wasm_astar.js';
+import { loadWasmModule, validateWasmModule } from '../wasm/loader';
+import type { WasmModuleAstar } from '../wasm/types';
+
+export const init = async (): Promise<void> => {
   // 1. Set up JavaScript functions that Rust will call
   const wasmImports = getWasmImports();
   
   // 2. Make functions globally available for wasm-bindgen
   const globalObj: { [key: string]: unknown } = globalThis;
   globalObj.js_log = (msg: string): void => wasmImports.js_log(msg);
-  globalObj.js_draw_tile = (layerId: number, px: number, py: number, size: number, ch: number, cs: number, cl: number, ca: number): void => 
-    wasmImports.js_draw_tile(layerId, px, py, size, ch, cs, cl, ca);
   // ... more functions
   
-  // 3. Load and initialize WASM module
-  const initResult = await initWasm();
+  // 3. Load and initialize WASM module with type safety
+  const wasmModule = await loadWasmModule<WasmModuleAstar>(
+    async () => await initWasm(),
+    validateAstarModule
+  );
   
-  // 4. Type-safe assignment with runtime checks
-  if (
-    wasmModuleExports.memory &&
-    wasmModuleExports.wasm_init &&
-    // ... more checks
-  ) {
-    WASM_ASTAR.wasmModule = wasmModule;
-    wasmModule.wasm_init(debug ? 1 : 0, renderIntervalMs, window.innerWidth, window.innerHeight);
-  }
+  // 4. Initialize the WASM module
+  wasmModule.wasm_init(debug ? 1 : 0, renderIntervalMs, window.innerWidth, window.innerHeight);
 };
 ```
 
-⚙️ **Under the Hood**: `wasm-bindgen` generates code that expects JavaScript functions to be in the global scope when `__wbg_get_imports()` runs. By assigning to `globalThis`, we ensure these functions are available when WASM initialization occurs.
+⚙️ **Under the Hood**: `wasm-bindgen` generates code that expects JavaScript functions to be in the global scope when `__wbg_get_imports()` runs. By assigning to `globalThis`, we ensure these functions are available when WASM initialization occurs. The `loadWasmModule` utility provides type-safe loading with runtime validation.
 
 ### Canvas Rendering Layers
 
-The application uses multiple canvas layers for efficient rendering:
+The A* pathfinding endpoint uses multiple canvas layers for efficient rendering. This is implemented in the route handler:
 
-```typescript:src/main.ts
+```typescript:src/routes/astar.ts
 js_create_layer(id: string, key: number): void {
   const canvas = WASM_ASTAR.layerWrapperEl.appendChild(
     document.createElement('canvas')
@@ -338,13 +532,13 @@ js_create_layer(id: string, key: number): void {
 - **Main layer**: Dynamic path visualization (redrawn every frame)
 - **FPS layer**: UI overlay (redrawn periodically)
 
-This is more efficient than redrawing everything every frame.
+This is more efficient than redrawing everything every frame. Other endpoints (like preprocessing) may use different rendering approaches (e.g., DOM manipulation for image display).
 
 ### Event Handling
 
-User input flows from browser events → TypeScript → WASM:
+User input flows from browser events → TypeScript → WASM. Each route handler sets up its own event listeners:
 
-```typescript:src/main.ts
+```typescript:src/routes/astar.ts
 window.addEventListener('keydown', (e: KeyboardEvent) => {
   if (WASM_ASTAR.wasmModule) {
     WASM_ASTAR.wasmModule.key_down(e.keyCode);
@@ -360,11 +554,13 @@ window.addEventListener('mousemove', (e: MouseEvent) => {
 });
 ```
 
+Different endpoints handle different events. The preprocessing endpoint, for example, handles file input and button clicks for image/text processing.
+
 ### Animation Loop with `requestAnimationFrame`
 
-Instead of `setTimeout` or `setInterval`, the application uses `requestAnimationFrame`:
+The A* pathfinding endpoint uses `requestAnimationFrame` for smooth animation:
 
-```typescript:src/main.ts
+```typescript:src/routes/astar.ts
 const requestNextFrame = (callback: FrameRequestCallback): void => {
   window.requestAnimationFrame(callback);
 };
@@ -387,6 +583,114 @@ const startIntervalTickRecursive = (ms: number): void => {
 - **Smooth**: Reduces jank and stuttering
 - **Modern**: Recommended approach for web animations
 
+Not all endpoints need animation loops. The preprocessing endpoint, for example, responds to user actions (button clicks) rather than running continuous animations.
+
+---
+
+## Shared WASM Utilities
+
+To ensure consistent, type-safe WASM module loading across all endpoints, the application provides shared utilities in `src/wasm/`.
+
+### Generic WASM Loader
+
+The `loadWasmModule` function in `src/wasm/loader.ts` provides a type-safe way to load and validate WASM modules:
+
+```typescript:src/wasm/loader.ts
+export async function loadWasmModule<T extends WasmModuleBase>(
+  initFn: () => Promise<unknown>,
+  validateExports: (exports: unknown) => T | null
+): Promise<T> {
+  try {
+    const initResult = await initFn();
+    const validated = validateExports(initResult);
+    
+    if (!validated) {
+      throw new WasmInitError('WASM module does not have expected exports');
+    }
+    
+    return validated;
+  } catch (error) {
+    if (error instanceof WasmInitError) {
+      throw error;
+    }
+    throw new WasmLoadError('Failed to load WASM module', error);
+  }
+}
+```
+
+This function:
+1. Calls the WASM initialization function
+2. Validates the exports using a type-safe validator
+3. Returns a typed WASM module or throws a descriptive error
+
+### Type Definitions
+
+Shared type definitions in `src/wasm/types.ts` ensure consistency:
+
+```typescript:src/wasm/types.ts
+export interface WasmModuleBase {
+  memory: WebAssembly.Memory;
+}
+
+export interface WasmModuleAstar extends WasmModuleBase {
+  wasm_init(debug: number, renderIntervalMs: number, windowWidth: number, windowHeight: number): void;
+  tick(elapsedTime: number): void;
+  // ... more methods
+}
+
+export interface WasmModulePreprocess extends WasmModuleBase {
+  preprocess_image(...): Uint8Array;
+  preprocess_text(...): Uint32Array;
+  // ... more methods
+}
+```
+
+Each WASM module interface extends `WasmModuleBase`, ensuring all modules have the required `memory` property while allowing module-specific functions.
+
+### Usage Example
+
+Here's how a route handler uses these utilities:
+
+```typescript:src/routes/astar.ts
+import { loadWasmModule, validateWasmModule } from '../wasm/loader';
+import type { WasmModuleAstar } from '../wasm/types';
+
+function validateAstarModule(exports: unknown): WasmModuleAstar | null {
+  if (!validateWasmModule(exports)) {
+    return null;
+  }
+  
+  // Additional validation for A* specific exports
+  if (
+    typeof exports.wasm_init === 'function' &&
+    typeof exports.tick === 'function' &&
+    // ... more checks
+  ) {
+    return exports as WasmModuleAstar;
+  }
+  
+  return null;
+}
+
+export const init = async (): Promise<void> => {
+  const wasmModule = await loadWasmModule<WasmModuleAstar>(
+    async () => await initWasm(),
+    validateAstarModule
+  );
+  
+  // Use wasmModule with full type safety
+  wasmModule.wasm_init(debug ? 1 : 0, renderIntervalMs, window.innerWidth, window.innerHeight);
+};
+```
+
+🧠 **Concept Break**: Why Shared Utilities?
+
+- **Consistency**: All endpoints use the same loading pattern
+- **Type Safety**: Compile-time guarantees about WASM module structure
+- **Error Handling**: Consistent error messages and error types
+- **Maintainability**: Changes to loading logic happen in one place
+- **Reusability**: Easy to add new endpoints following the same pattern
+
 ---
 
 ## WebAssembly Integration
@@ -406,42 +710,90 @@ This creates a `.wasm` binary that can run in any WebAssembly-compatible environ
 
 ### Build Process
 
-The build script (`scripts/build.sh`) orchestrates the compilation:
+The build process uses a two-script approach to handle multiple WASM modules:
+
+**Main build script** (`scripts/build.sh`) iterates over all workspace members:
 
 ```bash:scripts/build.sh
 #!/bin/bash
 set -e
 
-# 1. Compile Rust to WASM
-cargo build --target wasm32-unknown-unknown --release
+echo "BUILDING ALL WASM MODULES"
 
-# 2. Generate JavaScript bindings with wasm-bindgen
+# Clean previous build
+if [ -d "pkg" ]; then
+    rm -rf "pkg"
+fi
+
+# Build each WASM module
+./scripts/build-wasm.sh wasm-astar pkg/wasm_astar
+./scripts/build-wasm.sh wasm-preprocess pkg/wasm_preprocess
+
+echo "ALL WASM MODULES BUILT SUCCESSFULLY"
+```
+
+**Helper script** (`scripts/build-wasm.sh`) builds a single WASM crate:
+
+```bash:scripts/build-wasm.sh
+#!/bin/bash
+set -e
+
+CRATE_NAME=$1
+OUTPUT_DIR=$2
+
+# 1. Compile Rust crate to WASM
+cargo build --target wasm32-unknown-unknown --release --package "$CRATE_NAME"
+
+# 2. Convert crate name (hyphens to underscores for filename)
+WASM_FILENAME=$(echo "$CRATE_NAME" | sed 's/-/_/g')
+
+# 3. Generate JavaScript bindings with wasm-bindgen
 wasm-bindgen --target web \
-    --out-dir "$pkgDir" \
-    "target/wasm32-unknown-unknown/release/$wasmFilename.wasm"
+    --out-dir "$OUTPUT_DIR" \
+    "target/wasm32-unknown-unknown/release/${WASM_FILENAME}.wasm"
 
-# 3. Optimize WASM binary with wasm-opt
-wasm-opt -Os "$pkgDir/${wasmFilename}_bg.wasm" -o "$pkgDir/${wasmFilename}_bg.wasm"
+# 4. Optimize WASM binary with wasm-opt
+if command -v wasm-opt &> /dev/null; then
+    wasm-opt -Os "$OUTPUT_DIR/${WASM_FILENAME}_bg.wasm" -o "$OUTPUT_DIR/${WASM_FILENAME}_bg.wasm"
+fi
 ```
 
 ⚙️ **Under the Hood**: 
+- **Workspace build**: `cargo build --package` builds a specific workspace member
+- **Filename conversion**: Cargo converts hyphens to underscores in output filenames (e.g., `wasm-astar` → `wasm_astar.wasm`)
 - **`wasm-bindgen --target web`**: Generates JavaScript/TypeScript bindings for browser use
 - **`wasm-opt -Os`**: Optimizes for size (reduces binary size by ~30-50%)
 
 ### Generated Files
 
-After building, `wasm-bindgen` generates:
+After building, each WASM module generates its own set of files in `pkg/`:
 
-- **`wasm_astar_bg.wasm`**: The optimized WebAssembly binary
-- **`wasm_astar.js`**: JavaScript glue code that loads WASM and provides typed functions
-- **`wasm_astar_bg.wasm.d.ts`**: TypeScript type definitions
+```
+pkg/
+├── wasm_astar/
+│   ├── wasm_astar_bg.wasm      # Optimized WebAssembly binary
+│   ├── wasm_astar.js            # JavaScript glue code
+│   ├── wasm_astar.d.ts          # TypeScript type definitions
+│   └── wasm_astar_bg.wasm.d.ts  # WASM binary type definitions
+└── wasm_preprocess/
+    ├── wasm_preprocess_bg.wasm
+    ├── wasm_preprocess.js
+    ├── wasm_preprocess.d.ts
+    └── wasm_preprocess_bg.wasm.d.ts
+```
+
+Each module is self-contained with its own JavaScript bindings and type definitions.
 
 ### Loading WASM in the Browser
 
-Vite handles WASM loading automatically:
+Each route handler loads its own WASM module. Vite handles WASM loading automatically:
 
-```typescript:src/main.ts
-import initWasm from '../pkg/wasm_astar.js';
+```typescript:src/routes/astar.ts
+import initWasm from '../../pkg/wasm_astar/wasm_astar.js';
+```
+
+```typescript:src/routes/preprocess.ts
+import initWasm from '../../pkg/wasm_preprocess/wasm_preprocess.js';
 ```
 
 Vite's WASM plugin:
@@ -450,16 +802,19 @@ Vite's WASM plugin:
 3. Instantiates the WebAssembly module
 4. Provides the initialized module to your code
 
+Each route handler uses the shared `loadWasmModule` utility to ensure type-safe loading and validation.
+
 ### Memory Management
 
-WASM has its own linear memory space:
+Each WASM module has its own linear memory space:
 
-```typescript:src/types.ts
-export interface WasmModule {
+```typescript:src/wasm/types.ts
+export interface WasmModuleBase {
   memory: WebAssembly.Memory;
-  // ...
 }
 ```
+
+All WASM module interfaces extend `WasmModuleBase`, ensuring every module exposes its memory for potential JavaScript access.
 
 🧠 **Concept Break**: WASM Memory
 
@@ -467,21 +822,26 @@ export interface WasmModule {
 - **Shared with JavaScript**: JavaScript can read WASM memory (useful for passing large data)
 - **Bounds Checked**: WASM enforces memory safety (no buffer overflows)
 - **Growable**: Memory can expand as needed (up to limits)
+- **Per-Module**: Each WASM module has its own isolated memory space
 
 ### Performance Benefits
 
-Why use WASM for pathfinding?
+Why use WASM for these computations?
 
-- **Near-Native Speed**: A* algorithm runs at ~95% of native Rust performance
+- **Near-Native Speed**: Algorithms run at ~95% of native Rust performance
 - **Deterministic**: Same algorithm, same results, regardless of browser
 - **Memory Efficient**: Rust's zero-cost abstractions mean minimal overhead
 - **Type Safe**: Compile-time guarantees prevent runtime errors
+- **Modular**: Each endpoint loads only the WASM module it needs
 
 💡 **Tip**: WASM is ideal for:
 - Computational-heavy algorithms (pathfinding, image processing, cryptography)
 - Game engines and physics simulations
 - Data processing and transformation
+- Preprocessing for ML/AI workflows (image resizing, tokenization)
 - Any code that benefits from Rust's performance and safety
+
+The multi-module architecture allows each endpoint to showcase a different use case for WASM, demonstrating its versatility.
 
 ---
 
@@ -496,11 +856,11 @@ The Dockerfile uses a multi-stage build to create a minimal production image:
 ```dockerfile:Dockerfile
 # Stage 1: Rust WASM Builder
 FROM rust:alpine AS rust-builder
-# ... install dependencies, build WASM
+# ... install dependencies, build all WASM modules
 
 # Stage 2: Node.js Frontend Builder
-FROM node:20-alpine AS node-builder
-# ... install npm deps, build with Vite
+FROM node:22-alpine AS node-builder
+# ... install npm deps, build with Vite (multi-page)
 
 # Stage 3: Runtime (nginx)
 FROM nginx:alpine AS runtime
@@ -525,7 +885,7 @@ By using multi-stage builds, the final image is **92% smaller** than if we inclu
 FROM rust:alpine AS rust-builder
 
 # Install build dependencies
-RUN apk add --no-cache musl-dev perl make git bash
+RUN apk add --no-cache musl-dev perl make git bash jq
 
 # Install wasm-bindgen-cli (must match Cargo.toml version)
 RUN cargo install wasm-bindgen-cli --version 0.2.106
@@ -535,24 +895,40 @@ RUN apk add --no-cache binaryen
 
 WORKDIR /app
 
-# Copy Cargo files for dependency caching
+# Copy workspace Cargo.toml and member Cargo.toml files for dependency caching
 COPY Cargo.toml ./
+COPY wasm-astar/Cargo.toml ./wasm-astar/
+COPY wasm-preprocess/Cargo.toml ./wasm-preprocess/
+
+# Create dummy src files to cache dependencies
+RUN mkdir -p wasm-astar/src wasm-preprocess/src && \
+    echo "fn main() {}" > wasm-astar/src/lib.rs || true && \
+    echo "fn main() {}" > wasm-preprocess/src/lib.rs || true
 
 # Build dependencies (cached if Cargo.toml unchanged)
-RUN cargo build --target wasm32-unknown-unknown --release || true
+RUN cargo build --target wasm32-unknown-unknown --release --workspace || true
 
-# Copy source and build
-COPY src ./src
+# Copy actual source code
+COPY wasm-astar ./wasm-astar
+COPY wasm-preprocess ./wasm-preprocess
 COPY scripts ./scripts
+
+# Make build scripts executable
+RUN chmod +x scripts/build.sh scripts/build-wasm.sh
+
+# Build all WASM modules
 RUN ./scripts/build.sh
 ```
 
-⚙️ **Under the Hood**: Docker layer caching means if `Cargo.toml` doesn't change, dependency compilation is skipped, saving minutes of build time.
+⚙️ **Under the Hood**: 
+- Docker layer caching means if `Cargo.toml` files don't change, dependency compilation is skipped, saving minutes of build time
+- The workspace build compiles all member crates in parallel
+- The `build.sh` script iterates over all workspace members and builds each WASM module
 
 ### Stage 2: Frontend Build
 
 ```dockerfile:Dockerfile
-FROM node:20-alpine AS node-builder
+FROM node:22-alpine AS node-builder
 
 WORKDIR /app
 
@@ -560,18 +936,20 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install
 
-# Copy WASM build output from stage 1
+# Copy WASM build output from stage 1 (all modules)
 COPY --from=rust-builder /app/pkg ./pkg
 
 # Copy frontend source
 COPY src ./src
+COPY pages ./pages
 COPY index.html vite.config.ts tsconfig.json ./
+COPY public ./public
 
-# Build with Vite
+# Build with Vite (multi-page build)
 RUN npx vite build
 ```
 
-The `--from=rust-builder` syntax copies files from a previous stage, allowing us to pass the WASM build to the frontend build stage.
+The `--from=rust-builder` syntax copies files from a previous stage, allowing us to pass all WASM modules to the frontend build stage. Vite's multi-page configuration builds separate bundles for each HTML page in `pages/`.
 
 ### Stage 3: Production Runtime
 
@@ -657,9 +1035,11 @@ server {
         add_header Cache-Control "public, max-age=31536000, immutable";
     }
     
-    # Serve static files
+    # Serve static files and handle routing for specific HTML pages
     location / {
-        try_files $uri $uri/ /index.html;
+        # Try to serve specific HTML files based on the URI
+        # For example, /astar serves astar.html, /preprocess serves preprocess.html
+        try_files $uri $uri/ /pages/$uri.html /index.html;
     }
     
     # Security headers
@@ -675,6 +1055,8 @@ server {
     }
 }
 ```
+
+The `try_files` directive ensures that requests to `/astar` serve `pages/astar.html` and requests to `/preprocess` serve `pages/preprocess.html`, with `index.html` as a fallback.
 
 ⚙️ **Under the Hood**: The `$PORT` variable is substituted at container startup using `envsubst`. This allows the same Docker image to run on different ports (Render.com assigns ports dynamically).
 
@@ -723,15 +1105,21 @@ services:
     buildFilter:
       paths:
         - src/**
+        - wasm-astar/**
+        - wasm-preprocess/**
         - Cargo.toml
         - package.json
+        - vite.config.ts
+        - tsconfig.json
         - Dockerfile
         - nginx*.conf*
         - docker-entrypoint.sh
         - scripts/**
+        - pages/**
+        - index.html
 ```
 
-💡 **Tip**: `buildFilter` tells Render.com which files trigger a rebuild. This prevents unnecessary builds when only documentation changes.
+💡 **Tip**: `buildFilter` tells Render.com which files trigger a rebuild. This prevents unnecessary builds when only documentation changes. The filter includes all workspace member directories (`wasm-astar/**`, `wasm-preprocess/**`) and the `pages/` directory to ensure changes to any endpoint trigger a rebuild.
 
 ### Deployment Process
 
@@ -859,19 +1247,21 @@ Congratulations! You've now seen how a complete, production-ready web applicatio
 
 Now that you understand the architecture, try these exercises:
 
-1. **Modify the A* Algorithm**: Change the heuristic function in `src/world/mod.rs` to see how it affects pathfinding behavior
+1. **Modify the A* Algorithm**: Change the heuristic function in `wasm-astar/src/world/mod.rs` to see how it affects pathfinding behavior
 
 2. **Add a New Canvas Layer**: Create a UI layer that shows algorithm statistics (nodes explored, path length, etc.)
 
-3. **Optimize the Docker Build**: Experiment with different base images or build optimizations to reduce image size further
+3. **Add a New Endpoint**: Create a new endpoint with its own WASM module (see "Adding New Endpoints" section below)
 
-4. **Add Environment Variables**: Create a configuration system that allows different world sizes or quality settings via environment variables
+4. **Create a Shared Utility WASM Module**: Build a WASM module that provides utilities used by multiple endpoints
 
-5. **Implement WebSocket Support**: Add real-time multiplayer pathfinding (requires backend changes)
+5. **Optimize the Docker Build**: Experiment with different base images or build optimizations to reduce image size further
 
-6. **Profile Performance**: Use browser DevTools to profile WASM execution and identify bottlenecks
+6. **Add Environment Variables**: Create a configuration system that allows different settings via environment variables
 
-7. **Deploy to Another Platform**: Adapt the Dockerfile and configuration for AWS, Google Cloud, or Azure
+7. **Profile Performance**: Use browser DevTools to profile WASM execution and identify bottlenecks
+
+8. **Deploy to Another Platform**: Adapt the Dockerfile and configuration for AWS, Google Cloud, or Azure
 
 ### Further Reading
 
@@ -886,15 +1276,172 @@ Now that you understand the architecture, try these exercises:
 You've journeyed from Rust source code to a deployed web application. You understand:
 
 - How **Rust's type system** ensures memory safety while compiling to efficient WASM
+- How **Rust workspaces** enable multiple WASM modules in a single project
 - How **TypeScript** provides type safety for JavaScript-WASM interop
-- How **Vite** bundles and optimizes modern web applications
+- How **Client-side routing** enables modular, endpoint-based architecture
+- How **Vite** bundles and optimizes modern web applications with multi-page support
 - How **Docker multi-stage builds** create minimal production images
 - How **Nginx** serves static files with security and performance optimizations
 - How **Render.com** orchestrates deployments with zero-downtime
 
 This is a complete, production-ready stack. Every component serves a purpose, every configuration has a reason, and every line of code teaches you something about modern systems engineering.
 
-**You're now equipped to build and deploy your own full-stack Rust applications.**
+**You're now equipped to build and deploy your own full-stack Rust applications with multiple WASM modules.**
+
+---
+
+## Adding New Endpoints
+
+One of the key benefits of this architecture is how easy it is to add new endpoints. Here's a step-by-step guide using the `wasm-preprocess` endpoint as an example:
+
+### Step 1: Create a New Rust Crate
+
+Create a new directory for your WASM module:
+
+```bash
+mkdir wasm-preprocess
+cd wasm-preprocess
+```
+
+Create `Cargo.toml`:
+
+```toml:wasm-preprocess/Cargo.toml
+[package]
+name = "wasm-preprocess"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+```
+
+### Step 2: Add Crate to Workspace
+
+Update the root `Cargo.toml`:
+
+```toml:Cargo.toml
+[workspace]
+members = ["wasm-astar", "wasm-preprocess"]  # Add your crate here
+```
+
+### Step 3: Implement Rust Code
+
+Create `wasm-preprocess/src/lib.rs` with your WASM functions:
+
+```rust:wasm-preprocess/src/lib.rs
+use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen]
+pub fn preprocess_image(
+    image_data: &[u8],
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> Result<Vec<u8>, JsValue> {
+    // Your implementation
+}
+```
+
+### Step 4: Create Route Handler
+
+Create `src/routes/preprocess.ts`:
+
+```typescript:src/routes/preprocess.ts
+import initWasm from '../../pkg/wasm_preprocess/wasm_preprocess.js';
+import { loadWasmModule, validateWasmModule } from '../wasm/loader';
+import type { WasmModulePreprocess } from '../wasm/types';
+
+export const init = async (): Promise<void> => {
+  const wasmModule = await loadWasmModule<WasmModulePreprocess>(
+    async () => await initWasm(),
+    validatePreprocessModule
+  );
+  
+  // Initialize your endpoint
+  setupUI(wasmModule);
+};
+```
+
+### Step 5: Add Type Definitions
+
+Update `src/wasm/types.ts`:
+
+```typescript:src/wasm/types.ts
+export interface WasmModulePreprocess extends WasmModuleBase {
+  preprocess_image(...): Uint8Array;
+  // ... more methods
+}
+```
+
+### Step 6: Create HTML Page
+
+Create `pages/preprocess.html`:
+
+```html:pages/preprocess.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Preprocessing - Sigma WASM</title>
+    <link rel="stylesheet" href="/src/styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>WASM Preprocessing Demo</h1>
+        <!-- Your UI here -->
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
+```
+
+### Step 7: Register Route
+
+Update `src/main.ts`:
+
+```typescript:src/main.ts
+import { init as initPreprocess } from './routes/preprocess';
+
+routes.set('/preprocess', initPreprocess);
+```
+
+### Step 8: Update Vite Config (if needed)
+
+If you need a custom entry point, update `vite.config.ts`:
+
+```typescript:vite.config.ts
+rollupOptions: {
+  input: {
+    preprocess: resolve(__dirname, 'pages/preprocess.html'),
+    // ... other entries
+  },
+}
+```
+
+### Step 9: Build and Test
+
+The build scripts automatically handle the new crate:
+
+```bash
+./scripts/build.sh  # Builds all workspace members
+npm run dev         # Test locally
+```
+
+### That's It!
+
+The build system automatically:
+- Builds your new crate as part of the workspace
+- Generates JavaScript bindings
+- Includes it in the Docker build
+- Makes it available to your route handler
+
+💡 **Tip**: Follow the pattern established by existing endpoints. The shared utilities (`loader.ts`, `types.ts`) ensure consistency and type safety across all endpoints.
 
 ---
 
