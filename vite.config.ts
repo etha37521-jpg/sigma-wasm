@@ -86,17 +86,40 @@ function copyDir(src: string, dest: string, moduleName: string): void {
 function rewriteWasmImports(): Plugin {
   return {
     name: 'rewrite-wasm-imports',
+    renderChunk(code, chunk) {
+      // renderChunk processes chunks after they're generated, including external imports
+      // This ensures we catch dynamic imports even when modules are marked external
+      // Rewrite relative pkg/ imports to absolute /pkg/ paths
+      let modifiedCode = code;
+      
+      // Pattern 1: import('../../pkg/...') or import("../pkg/...")
+      modifiedCode = modifiedCode.replace(
+        /import\s*\((['"])(\.\.\/)+pkg\/([^'"]+)\1\)/g,
+        (match, quote, dots, path) => {
+          return `import(${quote}/pkg/${path}${quote})`;
+        }
+      );
+      
+      // Pattern 2: Single level relative ../pkg/...
+      modifiedCode = modifiedCode.replace(
+        /import\s*\((['"])\.\.\/pkg\/([^'"]+)\1\)/g,
+        (match, quote, path) => {
+          return `import(${quote}/pkg/${path}${quote})`;
+        }
+      );
+      
+      // Pattern 3: Already absolute but might need fixing (shouldn't happen, but just in case)
+      // This is a no-op but ensures consistency
+      
+      return modifiedCode !== code ? { code: modifiedCode, map: null } : null;
+    },
     generateBundle(options, bundle) {
-      // Rewrite relative pkg/ imports to absolute /pkg/ paths in all output files
-      // This ensures imports work correctly at runtime regardless of where the script is located
+      // Also process in generateBundle as fallback for any chunks that weren't processed
       for (const [fileName, chunkOrAsset] of Object.entries(bundle)) {
         if (chunkOrAsset.type === 'chunk' && chunkOrAsset.code) {
-          // Match relative imports like ../../pkg/ or ../pkg/ and rewrite to /pkg/
-          // Also handle cases where the path might have been transformed by Rollup
-          // Preserve the quote type (single or double) used in the original import
           let code = chunkOrAsset.code;
           
-          // Pattern 1: import('../../pkg/...') or import("../pkg/...")
+          // Same patterns as renderChunk
           code = code.replace(
             /import\s*\((['"])(\.\.\/)+pkg\/([^'"]+)\1\)/g,
             (match, quote, dots, path) => {
@@ -104,8 +127,6 @@ function rewriteWasmImports(): Plugin {
             }
           );
           
-          // Pattern 2: Already transformed paths that might need fixing
-          // This catches any remaining relative paths that might have been missed
           code = code.replace(
             /import\s*\((['"])\.\.\/pkg\/([^'"]+)\1\)/g,
             (match, quote, path) => {
@@ -188,12 +209,10 @@ export default defineConfig({
       output: {
         format: 'es',
       },
-      external: (id) => {
-        // Mark pkg/ directory imports as external - they should be loaded at runtime, not bundled
-        // This preserves the original module structure so exports are available
-        // We rewrite import.meta.url in the copied files to use absolute paths for WASM binary loading
-        return id.includes('/pkg/') || id.includes('\\pkg\\');
-      },
+      // REMOVED external marking - Vite needs to process pkg/ modules to preserve exports
+      // When marked external, the module loads but exports aren't accessible
+      // Instead, we'll let Vite bundle them but ensure the structure is preserved
+      // The copyWasmModules plugin ensures the original files are in dist/pkg/ for WASM binary loading
     },
   },
   server: {

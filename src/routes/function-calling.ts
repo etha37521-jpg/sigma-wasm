@@ -13,12 +13,46 @@ let wasmModuleExports: {
 
 const getInitWasm = async (): Promise<unknown> => {
   if (!wasmModuleExports) {
+    // Import path will be rewritten by vite plugin to absolute path in production
     const module = await import('../../pkg/wasm_agent_tools/wasm_agent_tools.js');
+    
+    // Validate module has required exports
+    if (typeof module !== 'object' || module === null) {
+      throw new Error('Imported module is not an object');
+    }
+    
+    const moduleKeys = Object.keys(module);
+    
+    // Debug logging
+    if (addLogEntry) {
+      addLogEntry(`Module loaded. Keys: ${moduleKeys.join(', ')}`);
+    }
+    
+    // Check for required exports - these should be on the module object from wasm-bindgen
+    if (!('calculate' in module) || typeof module.calculate !== 'function') {
+      throw new Error(`Module missing 'calculate' export. Available: ${moduleKeys.join(', ')}`);
+    }
+    if (!('process_text' in module) || typeof module.process_text !== 'function') {
+      throw new Error(`Module missing 'process_text' export. Available: ${moduleKeys.join(', ')}`);
+    }
+    if (!('get_stats' in module) || typeof module.get_stats !== 'function') {
+      throw new Error(`Module missing 'get_stats' export. Available: ${moduleKeys.join(', ')}`);
+    }
+    if (!('default' in module) || typeof module.default !== 'function') {
+      throw new Error(`Module missing 'default' export. Available: ${moduleKeys.join(', ')}`);
+    }
+    
+    // Extract and assign functions - we've validated they exist and are functions above
+    // TypeScript can't narrow the dynamic import type, so we need assertions after validation
     wasmModuleExports = {
-      default: module.default,
-      calculate: module.calculate,
-      process_text: module.process_text,
-      get_stats: module.get_stats,
+      // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+      default: module.default as () => Promise<unknown>,
+      // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+      calculate: module.calculate as (expression: string) => string,
+      // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+      process_text: module.process_text as (text: string, operation: string) => string,
+      // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+      get_stats: module.get_stats as (data: Uint8Array) => string,
     };
   }
   if (!wasmModuleExports) {
