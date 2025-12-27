@@ -1,6 +1,6 @@
 use wasm_bindgen::prelude::*;
 use std::sync::{LazyLock, Mutex};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Tile type enumeration for 5 simple tile types
 /// 
@@ -66,6 +66,222 @@ impl WfcState {
             (q - 1, r + 1),
         ]
     }
+}
+
+/// Hex coordinate structure for Voronoi generation
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct HexCoord {
+    q: i32,
+    r: i32,
+}
+
+/// Seed point for Voronoi region generation
+#[derive(Clone, Copy, Debug)]
+struct VoronoiSeed {
+    q: i32,
+    r: i32,
+    tile_type: TileType,
+}
+
+/// Calculate hex distance between two hex coordinates (cube distance)
+/// Uses axial coordinates converted to cube coordinates
+fn hex_distance(q1: i32, r1: i32, q2: i32, r2: i32) -> i32 {
+    let s1 = -q1 - r1;
+    let s2 = -q2 - r2;
+    (q1 - q2).abs().max((r1 - r2).abs()).max((s1 - s2).abs())
+}
+
+/// Cube coordinate structure
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CubeCoord {
+    q: i32,
+    r: i32,
+    s: i32,
+}
+
+/// Cube directions for hex grid navigation
+const CUBE_DIRECTIONS: [CubeCoord; 6] = [
+    CubeCoord { q: 1, r: 0, s: -1 },   // Direction 0
+    CubeCoord { q: 1, r: -1, s: 0 },   // Direction 1
+    CubeCoord { q: 0, r: -1, s: 1 },   // Direction 2
+    CubeCoord { q: -1, r: 0, s: 1 },  // Direction 3
+    CubeCoord { q: -1, r: 1, s: 0 },  // Direction 4
+    CubeCoord { q: 0, r: 1, s: -1 },  // Direction 5
+];
+
+/// Add two cube coordinates
+fn cube_add(a: CubeCoord, b: CubeCoord) -> CubeCoord {
+    CubeCoord {
+        q: a.q + b.q,
+        r: a.r + b.r,
+        s: a.s + b.s,
+    }
+}
+
+/// Scale a cube coordinate by a factor
+fn cube_scale(hex: CubeCoord, factor: i32) -> CubeCoord {
+    CubeCoord {
+        q: hex.q * factor,
+        r: hex.r * factor,
+        s: hex.s * factor,
+    }
+}
+
+/// Get cube neighbor in specified direction (0-5)
+fn cube_neighbor(cube: CubeCoord, direction: usize) -> CubeCoord {
+    cube_add(cube, CUBE_DIRECTIONS[direction % 6])
+}
+
+/// Generate ring of tiles at specific layer (radius) around center
+fn cube_ring(center: CubeCoord, radius: i32) -> Vec<CubeCoord> {
+    if radius == 0 {
+        return vec![center];
+    }
+    
+    let mut results = Vec::new();
+    
+    // Start at the first hex of the ring by moving from the center
+    // Move 'radius' steps in direction 4 (CUBE_DIRECTIONS[4])
+    let mut current_hex = cube_add(center, cube_scale(CUBE_DIRECTIONS[4], radius));
+    
+    // Traverse the six sides of the hexagonal ring
+    for i in 0..6 {
+        // For each side, take 'radius' steps in the current direction
+        for _j in 0..radius {
+            results.push(current_hex);
+            current_hex = cube_neighbor(current_hex, i);
+        }
+    }
+    
+    results
+}
+
+/// Generate hexagon grid up to max_layer
+/// Returns all hex coordinates within the hexagon pattern
+/// Matches TypeScript implementation using cube coordinates
+fn generate_hex_grid(max_layer: i32, center_q: i32, center_r: i32) -> Vec<HexCoord> {
+    let mut grid_set = HashSet::new();
+    let center_cube = CubeCoord {
+        q: center_q,
+        r: center_r,
+        s: -center_q - center_r,
+    };
+    
+    // Generate grid from center outwards, adding one ring at a time
+    for layer in 0..=max_layer {
+        let ring = cube_ring(center_cube, layer);
+        for cube in ring {
+            // Use tuple of coordinates as hashable key for the set
+            grid_set.insert((cube.q, cube.r, cube.s));
+        }
+    }
+    
+    // Convert set to array of HexCoord, verifying cube coordinate constraint
+    let mut grid = Vec::new();
+    for (q, r, s) in grid_set {
+        // Verify cube coordinate is valid (q + r + s = 0)
+        if q + r + s == 0 {
+            grid.push(HexCoord { q, r });
+        }
+    }
+    
+    grid
+}
+
+/// Generate Voronoi regions for specified tile types
+/// 
+/// **Learning Point**: Generates seed points for each region type and assigns
+/// each hex tile to the nearest seed point, creating Voronoi regions.
+/// Returns JSON string with array of {q, r, tileType} objects.
+/// 
+/// @param max_layer - Maximum layer of hexagon (determines grid size)
+/// @param center_q - Center q coordinate
+/// @param center_r - Center r coordinate
+/// @param forest_seeds - Number of forest region seeds
+/// @param water_seeds - Number of water region seeds
+/// @param grass_seeds - Number of grass region seeds
+/// @returns JSON string with array of pre-constraints: [{"q":0,"r":0,"tileType":3},...]
+#[wasm_bindgen]
+pub fn generate_voronoi_regions(
+    max_layer: i32,
+    center_q: i32,
+    center_r: i32,
+    forest_seeds: i32,
+    water_seeds: i32,
+    grass_seeds: i32,
+) -> String {
+    // Generate hex grid
+    let hex_grid = generate_hex_grid(max_layer, center_q, center_r);
+    
+    if hex_grid.is_empty() {
+        return "[]".to_string();
+    }
+    
+    // Find bounds for seed generation
+    let min_q = hex_grid.iter().map(|h| h.q).min().unwrap_or(0);
+    let max_q = hex_grid.iter().map(|h| h.q).max().unwrap_or(0);
+    let min_r = hex_grid.iter().map(|h| h.r).min().unwrap_or(0);
+    let max_r = hex_grid.iter().map(|h| h.r).max().unwrap_or(0);
+    
+    // Generate seed points
+    let mut seeds: Vec<VoronoiSeed> = Vec::new();
+    
+    // Generate forest seeds
+    for _ in 0..forest_seeds {
+        let q = (js_random() * (max_q - min_q + 1) as f64) as i32 + min_q;
+        let r = (js_random() * (max_r - min_r + 1) as f64) as i32 + min_r;
+        seeds.push(VoronoiSeed {
+            q,
+            r,
+            tile_type: TileType::Forest,
+        });
+    }
+    
+    // Generate water seeds
+    for _ in 0..water_seeds {
+        let q = (js_random() * (max_q - min_q + 1) as f64) as i32 + min_q;
+        let r = (js_random() * (max_r - min_r + 1) as f64) as i32 + min_r;
+        seeds.push(VoronoiSeed {
+            q,
+            r,
+            tile_type: TileType::Water,
+        });
+    }
+    
+    // Generate grass seeds
+    for _ in 0..grass_seeds {
+        let q = (js_random() * (max_q - min_q + 1) as f64) as i32 + min_q;
+        let r = (js_random() * (max_r - min_r + 1) as f64) as i32 + min_r;
+        seeds.push(VoronoiSeed {
+            q,
+            r,
+            tile_type: TileType::Grass,
+        });
+    }
+    
+    // Assign each hex to nearest seed and build JSON
+    let mut json_parts = Vec::new();
+    for hex in hex_grid {
+        let mut nearest_seed: Option<&VoronoiSeed> = None;
+        let mut min_dist = i32::MAX;
+        
+        for seed in &seeds {
+            let dist = hex_distance(hex.q, hex.r, seed.q, seed.r);
+            if dist < min_dist {
+                min_dist = dist;
+                nearest_seed = Some(seed);
+            }
+        }
+        
+        if let Some(seed) = nearest_seed {
+            json_parts.push(format!(
+                r#"{{"q":{},"r":{},"tileType":{}}}"#,
+                hex.q, hex.r, seed.tile_type as i32
+            ));
+        }
+    }
+    
+    format!("[{}]", json_parts.join(","))
 }
 
 static WFC_STATE: LazyLock<Mutex<WfcState>> = LazyLock::new(|| Mutex::new(WfcState::new()));

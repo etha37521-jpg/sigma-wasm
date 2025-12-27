@@ -60,6 +60,9 @@ const getInitWasm = async (): Promise<unknown> => {
     if (!('get_stats' in moduleUnknown) || typeof moduleUnknown.get_stats !== 'function') {
       throw new Error(`Module missing 'get_stats' export. Available: ${moduleKeys.join(', ')}`);
     }
+    if (!('generate_voronoi_regions' in moduleUnknown) || typeof moduleUnknown.generate_voronoi_regions !== 'function') {
+      throw new Error(`Module missing 'generate_voronoi_regions' export. Available: ${moduleKeys.join(', ')}`);
+    }
     
     // Store module as Record after validation
     // TypeScript can't narrow dynamic import types, so we use Record pattern
@@ -187,6 +190,9 @@ function validateBabylonWfcModule(exports: unknown): WasmModuleBabylonWfc | null
     if (typeof wasmModuleRecord.get_stats !== 'function') {
       missingExports.push('get_stats (function)');
     }
+    if (typeof wasmModuleRecord.generate_voronoi_regions !== 'function') {
+      missingExports.push('generate_voronoi_regions (function)');
+    }
   }
   
   if (missingExports.length > 0) {
@@ -208,6 +214,7 @@ function validateBabylonWfcModule(exports: unknown): WasmModuleBabylonWfc | null
   const setPreConstraintFunc = wasmModuleRecord.set_pre_constraint;
   const clearPreConstraintsFunc = wasmModuleRecord.clear_pre_constraints;
   const getStatsFunc = wasmModuleRecord.get_stats;
+  const generateVoronoiRegionsFunc = wasmModuleRecord.generate_voronoi_regions;
   
   if (
     typeof generateLayoutFunc !== 'function' ||
@@ -215,7 +222,8 @@ function validateBabylonWfcModule(exports: unknown): WasmModuleBabylonWfc | null
     typeof clearLayoutFunc !== 'function' ||
     typeof setPreConstraintFunc !== 'function' ||
     typeof clearPreConstraintsFunc !== 'function' ||
-    typeof getStatsFunc !== 'function'
+    typeof getStatsFunc !== 'function' ||
+    typeof generateVoronoiRegionsFunc !== 'function'
   ) {
     return null;
   }
@@ -250,6 +258,18 @@ function validateBabylonWfcModule(exports: unknown): WasmModuleBabylonWfc | null
       // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment
       const result = getStatsFunc();
       return typeof result === 'string' ? result : '{}';
+    },
+    generate_voronoi_regions: (
+      max_layer: number,
+      center_q: number,
+      center_r: number,
+      forest_seeds: number,
+      water_seeds: number,
+      grass_seeds: number
+    ): string => {
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment
+      const result = generateVoronoiRegionsFunc(max_layer, center_q, center_r, forest_seeds, water_seeds, grass_seeds);
+      return typeof result === 'string' ? result : '[]';
     },
   };
 }
@@ -1235,7 +1255,6 @@ function generateUShapedFootprint(
  * Generate a building footprint of the specified shape
  * @deprecated Not currently used - kept for potential future adjacency constraints
  */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function generateBuildingFootprint(
   seedX: number,
   seedY: number,
@@ -1260,17 +1279,216 @@ export function generateBuildingFootprint(
 }
 
 /**
+ * Hex A* pathfinding for road connectivity validation
+ * 
+ * Uses cube coordinates for distance calculations and explores 6 hex neighbors.
+ * Returns path from start to goal, or null if unreachable.
+ * 
+ * Note: Currently not used in road connectivity validation (BFS is used instead),
+ * but available for future pathfinding needs.
+ */
+export function hexAStar(
+  start: HexCoord,
+  goal: HexCoord,
+  isValid: (q: number, r: number) => boolean
+): Array<HexCoord> | null {
+  interface AStarNode {
+    q: number;
+    r: number;
+    g: number;
+    h: number;
+    f: number;
+    parent: AStarNode | null;
+  }
+
+  // Convert axial to cube for distance calculation
+  const goalCube = HEX_UTILS.axialToCube(goal.q, goal.r);
+
+  // Calculate hex distance heuristic (cube distance)
+  const heuristic = (q: number, r: number): number => {
+    const cube = HEX_UTILS.axialToCube(q, r);
+    return HEX_UTILS.cubeDistance(cube, goalCube);
+  };
+
+  const startNode: AStarNode = {
+    q: start.q,
+    r: start.r,
+    g: 0,
+    h: heuristic(start.q, start.r),
+    f: 0,
+    parent: null,
+  };
+  startNode.f = startNode.g + startNode.h;
+
+  const openSet = new Map<string, AStarNode>();
+  const closedSet = new Set<string>();
+  openSet.set(`${start.q},${start.r}`, startNode);
+
+  while (openSet.size > 0) {
+    // Find node with lowest f score
+    let current: AStarNode | null = null;
+    let currentKey = '';
+    let minF = Number.POSITIVE_INFINITY;
+
+    for (const [key, node] of openSet.entries()) {
+      if (node.f < minF) {
+        minF = node.f;
+        current = node;
+        currentKey = key;
+      }
+    }
+
+    if (!current) {
+      break;
+    }
+
+    // Remove from open set, add to closed set
+    openSet.delete(currentKey);
+    closedSet.add(currentKey);
+
+    // Check if we reached the goal
+    if (current.q === goal.q && current.r === goal.r) {
+      // Reconstruct path
+      const path: Array<HexCoord> = [];
+      let node: AStarNode | null = current;
+      while (node) {
+        path.unshift({ q: node.q, r: node.r });
+        node = node.parent;
+      }
+      return path;
+    }
+
+    // Explore neighbors
+    const neighbors = HEX_UTILS.getNeighbors(current.q, current.r);
+    for (const neighbor of neighbors) {
+      const neighborKey = `${neighbor.q},${neighbor.r}`;
+
+      if (closedSet.has(neighborKey)) {
+        continue;
+      }
+
+      if (!isValid(neighbor.q, neighbor.r)) {
+        continue;
+      }
+
+      const tentativeG = current.g + 1;
+      const existingNode = openSet.get(neighborKey);
+
+      if (!existingNode || tentativeG < existingNode.g) {
+        const h = heuristic(neighbor.q, neighbor.r);
+        const newNode: AStarNode = {
+          q: neighbor.q,
+          r: neighbor.r,
+          g: tentativeG,
+          h,
+          f: tentativeG + h,
+          parent: current,
+        };
+        openSet.set(neighborKey, newNode);
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Get neighboring hex coordinates that are roads
+ */
+function getRoadNeighbors(
+  q: number,
+  r: number,
+  getTileAt: (q: number, r: number) => number
+): Array<HexCoord> {
+  const neighbors = HEX_UTILS.getNeighbors(q, r);
+  const roadNeighbors: Array<HexCoord> = [];
+
+  for (const neighbor of neighbors) {
+    const tileNum = getTileAt(neighbor.q, neighbor.r);
+    if (tileNum === 2) {
+      // TileType::Road = 2
+      roadNeighbors.push(neighbor);
+    }
+  }
+
+  return roadNeighbors;
+}
+
+/**
+ * Check if all road tiles form a single connected component
+ * 
+ * Uses BFS to find all reachable road tiles from a starting road.
+ * Returns true if all roads are reachable (single connected component).
+ */
+function areRoadsConnected(
+  roadTiles: Array<HexCoord>,
+  getTileAt: (q: number, r: number) => number
+): boolean {
+  if (roadTiles.length === 0) {
+    return true;
+  }
+
+  if (roadTiles.length === 1) {
+    // Single road tile - check if it has at least one road neighbor
+    const road = roadTiles[0];
+    if (road) {
+      const neighbors = getRoadNeighbors(road.q, road.r, getTileAt);
+      return neighbors.length > 0;
+    }
+    return false;
+  }
+
+  // BFS to find all reachable roads from first road tile
+  const visited = new Set<string>();
+  const queue: Array<HexCoord> = [];
+  const firstRoad = roadTiles[0];
+
+  if (!firstRoad) {
+    return false;
+  }
+
+  queue.push(firstRoad);
+  visited.add(`${firstRoad.q},${firstRoad.r}`);
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current) {
+      continue;
+    }
+
+    const neighbors = getRoadNeighbors(current.q, current.r, getTileAt);
+    for (const neighbor of neighbors) {
+      const neighborKey = `${neighbor.q},${neighbor.r}`;
+      if (!visited.has(neighborKey)) {
+        visited.add(neighborKey);
+        queue.push(neighbor);
+      }
+    }
+  }
+
+  // Check if all road tiles were visited
+  return visited.size === roadTiles.length;
+}
+
+/**
  * Convert layout constraints to pre-constraints
  * 
  * Simplified version: Sets tile types for all hexagon tiles using hash map storage.
  * No bounds checking needed - all hexagon tiles are stored.
+ * 
+ * Now includes:
+ * - Voronoi region priors for forest, water, and grass
+ * - Road connectivity validation
  */
 function constraintsToPreConstraints(
-  constraints: LayoutConstraints,
-  _width: number,
-  _height: number
+  constraints: LayoutConstraints
 ): Array<{ q: number; r: number; tileType: TileType }> {
-  const preConstraints: Array<{ q: number; r: number; tileType: TileType }> = [];
+  if (!WASM_BABYLON_WFC.wasmModule) {
+    if (addLogEntry !== null) {
+      addLogEntry('WASM module not available for Voronoi generation', 'error');
+    }
+    return [];
+  }
 
   // Use hexagon pattern - layer 30 gives 2791 tiles
   const maxLayer = 30;
@@ -1278,69 +1496,228 @@ function constraintsToPreConstraints(
   const centerQ = 0;
   const centerR = 0;
 
-  // Generate hexagon grid using cube coordinates and layer rings
+  // Generate hexagon grid for reference
   const hexGrid = HEX_UTILS.generateHexGrid(maxLayer, centerQ, centerR);
-  
-  // Debug: Log hexagon generation
-  if (addLogEntry !== null) {
-    const logFn = addLogEntry;
-    logFn(`Hexagon Grid Generation: Generated ${hexGrid.length} tiles (expected: 2791 for layer 30)`, 'info');
-  }
-  
-  // Set default tile type (grass) for all hexagon tiles
-  // Then randomly assign other tile types based on constraints
   const totalTiles = hexGrid.length;
-  const grassRatio = constraints.grassRatio;
-  const totalGrassCells = Math.floor(totalTiles * grassRatio);
-  
-  // Create array of all hex coordinates
-  const allHexes = hexGrid.map((hex) => ({ q: hex.q, r: hex.r }));
-  
-  // Randomly shuffle hex coordinates
-  for (let i = allHexes.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    const temp = allHexes[i];
-    allHexes[i] = allHexes[j];
-    allHexes[j] = temp;
+
+  if (addLogEntry !== null) {
+    addLogEntry(`Hexagon Grid Generation: Generated ${hexGrid.length} tiles (expected: 2791 for layer 30)`, 'info');
   }
-  
-  // Assign grass to first totalGrassCells
-  for (let i = 0; i < totalGrassCells; i++) {
-    preConstraints.push({ q: allHexes[i]?.q ?? 0, r: allHexes[i]?.r ?? 0, tileType: { type: 'grass' } });
+
+  // Step 1: Generate Voronoi regions for forest, water, and grass using WASM
+  // Seed counts: forest=3-5, water=2-4, grass=5-8 (configurable)
+  const forestSeeds = 4;
+  const waterSeeds = 3;
+  const grassSeeds = 6;
+
+  if (addLogEntry !== null) {
+    addLogEntry(`Generating Voronoi regions: ${forestSeeds} forest, ${waterSeeds} water, ${grassSeeds} grass seeds`, 'info');
   }
-  
-  // Randomly assign other tile types to remaining tiles
-  // Simple distribution: 10% building, 10% road, 10% forest, 5% water, rest grass
-  for (let i = totalGrassCells; i < allHexes.length; i++) {
-    const hex = allHexes[i];
-    if (hex) {
-      const rand = Math.random();
-      let tileType: TileType;
-      if (rand < 0.1) {
-        tileType = { type: 'building' };
-      } else if (rand < 0.2) {
-        tileType = { type: 'road' };
-      } else if (rand < 0.3) {
-        tileType = { type: 'forest' };
-      } else if (rand < 0.35) {
-        tileType = { type: 'water' };
-      } else {
-        tileType = { type: 'grass' };
+
+  const voronoiJson = WASM_BABYLON_WFC.wasmModule.generate_voronoi_regions(
+    maxLayer,
+    centerQ,
+    centerR,
+    forestSeeds,
+    waterSeeds,
+    grassSeeds
+  );
+
+  // Parse Voronoi regions from JSON
+  const voronoiConstraints: Array<{ q: number; r: number; tileType: TileType }> = [];
+  try {
+    const parsed: unknown = JSON.parse(voronoiJson);
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        if (typeof item === 'object' && item !== null && !Array.isArray(item)) {
+          // Helper to safely get property from unknown object
+          // We've already validated item is an object, but TypeScript needs help
+          const getPropertyFromUnknown = (obj: unknown, key: string): unknown => {
+            if (typeof obj === 'object' && obj !== null) {
+              const descriptor = Object.getOwnPropertyDescriptor(obj, key);
+              return descriptor ? descriptor.value : undefined;
+            }
+            return undefined;
+          };
+
+          const qCandidate = getPropertyFromUnknown(item, 'q');
+          const rCandidate = getPropertyFromUnknown(item, 'r');
+          const tileTypeCandidate = getPropertyFromUnknown(item, 'tileType');
+
+          if (
+            typeof qCandidate === 'number' &&
+            typeof rCandidate === 'number' &&
+            typeof tileTypeCandidate === 'number'
+          ) {
+            const tileType = tileTypeFromNumber(tileTypeCandidate);
+            if (tileType) {
+              voronoiConstraints.push({ q: qCandidate, r: rCandidate, tileType });
+            }
+          }
+        }
       }
-      preConstraints.push({ q: hex.q, r: hex.r, tileType });
+    }
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+    if (addLogEntry !== null) {
+      addLogEntry(`Failed to parse Voronoi regions: ${errorMsg}`, 'warning');
     }
   }
 
+  if (addLogEntry !== null) {
+    const forestCount = voronoiConstraints.filter((pc) => pc.tileType.type === 'forest').length;
+    const waterCount = voronoiConstraints.filter((pc) => pc.tileType.type === 'water').length;
+    const grassCount = voronoiConstraints.filter((pc) => pc.tileType.type === 'grass').length;
+    addLogEntry(`Voronoi regions: ${forestCount} forest, ${waterCount} water, ${grassCount} grass`, 'info');
+  }
+
+  // Step 2: Create a set of occupied hexes from Voronoi regions
+  const occupiedHexes = new Set<string>();
+  for (const constraint of voronoiConstraints) {
+    occupiedHexes.add(`${constraint.q},${constraint.r}`);
+  }
+
+  // Step 3: Generate buildings on remaining tiles
+  const buildingConstraints: Array<{ q: number; r: number; tileType: TileType }> = [];
+  const availableHexes: Array<HexCoord> = [];
+
+  for (const hex of hexGrid) {
+    const hexKey = `${hex.q},${hex.r}`;
+    if (!occupiedHexes.has(hexKey)) {
+      availableHexes.push(hex);
+    }
+  }
+
+  // Shuffle available hexes for building placement
+  for (let i = availableHexes.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const temp = availableHexes[i];
+    if (temp && availableHexes[j]) {
+      availableHexes[i] = availableHexes[j];
+      availableHexes[j] = temp;
+    }
+  }
+
+  // Place buildings based on density
+  const buildingDensity = constraints.buildingDensity;
+  let buildingRatio = 0.1;
+  if (buildingDensity === 'sparse') {
+    buildingRatio = 0.05;
+  } else if (buildingDensity === 'dense') {
+    buildingRatio = 0.15;
+  }
+
+  const buildingCount = Math.floor(availableHexes.length * buildingRatio);
+  for (let i = 0; i < buildingCount && i < availableHexes.length; i++) {
+    const hex = availableHexes[i];
+    if (hex) {
+      buildingConstraints.push({ q: hex.q, r: hex.r, tileType: { type: 'building' } });
+      occupiedHexes.add(`${hex.q},${hex.r}`);
+    }
+  }
+
+  // Step 4: Generate roads with connectivity validation (with retry)
+  const maxRetries = 10;
+  let roadConstraints: Array<{ q: number; r: number; tileType: TileType }> = [];
+  let roadsConnected = false;
+
+  for (let attempt = 0; attempt < maxRetries && !roadsConnected; attempt++) {
+    roadConstraints = [];
+    const roadHexes: Array<HexCoord> = [];
+
+    // Find remaining available hexes for roads
+    for (const hex of hexGrid) {
+      const hexKey = `${hex.q},${hex.r}`;
+      if (!occupiedHexes.has(hexKey)) {
+        roadHexes.push(hex);
+      }
+    }
+
+    // Shuffle for random road placement
+    for (let i = roadHexes.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const temp = roadHexes[i];
+      if (temp && roadHexes[j]) {
+        roadHexes[i] = roadHexes[j];
+        roadHexes[j] = temp;
+      }
+    }
+
+    // Place roads (10% of remaining tiles)
+    const roadCount = Math.floor(roadHexes.length * 0.1);
+    for (let i = 0; i < roadCount && i < roadHexes.length; i++) {
+      const hex = roadHexes[i];
+      if (hex) {
+        roadConstraints.push({ q: hex.q, r: hex.r, tileType: { type: 'road' } });
+      }
+    }
+
+    // Validate road connectivity
+    // Create a temporary map for tile lookup
+    const tileMap = new Map<string, TileType>();
+    for (const constraint of voronoiConstraints) {
+      tileMap.set(`${constraint.q},${constraint.r}`, constraint.tileType);
+    }
+    for (const constraint of buildingConstraints) {
+      tileMap.set(`${constraint.q},${constraint.r}`, constraint.tileType);
+    }
+    for (const constraint of roadConstraints) {
+      tileMap.set(`${constraint.q},${constraint.r}`, constraint.tileType);
+    }
+
+    const getTileAt = (q: number, r: number): number => {
+      const tile = tileMap.get(`${q},${r}`);
+      if (!tile) {
+        return -1;
+      }
+      return tileTypeToNumber(tile);
+    };
+
+    const roadTiles: Array<HexCoord> = roadConstraints.map((rc) => ({ q: rc.q, r: rc.r }));
+    roadsConnected = areRoadsConnected(roadTiles, getTileAt);
+
+    if (!roadsConnected && attempt < maxRetries - 1) {
+      if (addLogEntry !== null) {
+        addLogEntry(`Road connectivity validation failed, retrying (attempt ${attempt + 1}/${maxRetries})`, 'warning');
+      }
+    }
+  }
+
+  if (!roadsConnected) {
+    if (addLogEntry !== null) {
+      addLogEntry('Road connectivity validation failed after max retries, using roads anyway', 'warning');
+    }
+  } else if (addLogEntry !== null) {
+    addLogEntry('Road connectivity validation passed', 'success');
+  }
+
+  // Step 5: Fill remaining tiles with grass
+  const allConstraints = [...voronoiConstraints, ...buildingConstraints, ...roadConstraints];
+  const finalOccupied = new Set<string>();
+  for (const constraint of allConstraints) {
+    finalOccupied.add(`${constraint.q},${constraint.r}`);
+  }
+
+  const grassConstraints: Array<{ q: number; r: number; tileType: TileType }> = [];
+  for (const hex of hexGrid) {
+    const hexKey = `${hex.q},${hex.r}`;
+    if (!finalOccupied.has(hexKey)) {
+      grassConstraints.push({ q: hex.q, r: hex.r, tileType: { type: 'grass' } });
+    }
+  }
+
+  // Combine all constraints
+  const preConstraints = [...voronoiConstraints, ...buildingConstraints, ...roadConstraints, ...grassConstraints];
+
   // Debug: Log final pre-constraints count
   if (addLogEntry !== null) {
-    const logFn = addLogEntry;
     const grassCount = preConstraints.filter((pc) => pc.tileType.type === 'grass').length;
     const buildingCount = preConstraints.filter((pc) => pc.tileType.type === 'building').length;
     const roadCount = preConstraints.filter((pc) => pc.tileType.type === 'road').length;
     const forestCount = preConstraints.filter((pc) => pc.tileType.type === 'forest').length;
     const waterCount = preConstraints.filter((pc) => pc.tileType.type === 'water').length;
-    logFn(`Pre-Constraints: ${preConstraints.length} total (${grassCount} grass, ${buildingCount} building, ${roadCount} road, ${forestCount} forest, ${waterCount} water)`, 'info');
-    logFn(`Pre-Constraints: Expected ${totalTiles} hexagon tiles, got ${preConstraints.length} pre-constraints`, 'info');
+    addLogEntry(`Pre-Constraints: ${preConstraints.length} total (${grassCount} grass, ${buildingCount} building, ${roadCount} road, ${forestCount} forest, ${waterCount} water)`, 'info');
+    addLogEntry(`Pre-Constraints: Expected ${totalTiles} hexagon tiles, got ${preConstraints.length} pre-constraints`, 'info');
   }
 
   return preConstraints;
@@ -1391,7 +1768,7 @@ async function generateLayoutFromText(
 
     WASM_BABYLON_WFC.wasmModule.clear_pre_constraints();
 
-    const preConstraints = constraintsToPreConstraints(constraints, 0, 0);
+    const preConstraints = constraintsToPreConstraints(constraints);
 
     // Set pre-constraints using hex coordinates directly (no conversion needed)
     for (const preConstraint of preConstraints) {
@@ -1670,7 +2047,7 @@ export const init = async (): Promise<void> => {
     WASM_BABYLON_WFC.wasmModule.clear_pre_constraints();
     
     const defaultConstraints = getDefaultConstraints();
-    const preConstraints = constraintsToPreConstraints(defaultConstraints, 0, 0);
+    const preConstraints = constraintsToPreConstraints(defaultConstraints);
     
     // Set pre-constraints using hex coordinates directly (no conversion needed)
     for (const preConstraint of preConstraints) {

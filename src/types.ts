@@ -245,6 +245,14 @@ export interface WasmModuleBabylonWfc {
   clear_pre_constraints(): void;
   clear_layout(): void;
   get_stats(): string;
+  generate_voronoi_regions(
+    max_layer: number,
+    center_q: number,
+    center_r: number,
+    forest_seeds: number,
+    water_seeds: number,
+    grass_seeds: number
+  ): string;
 }
 
 /**
