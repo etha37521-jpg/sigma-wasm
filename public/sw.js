@@ -96,6 +96,37 @@ function shouldUseCacheFirst(url) {
   return true;
 }
 
+// Helper to check if request should skip service worker interception
+// External URLs (especially large model files) should bypass the service worker
+// to avoid timeout issues and allow proper error handling
+function shouldSkipInterception(url) {
+  const urlObj = new URL(url, self.location.origin);
+  
+  // Skip external URLs (not same-origin)
+  // This allows large model downloads to proceed without service worker interference
+  if (urlObj.origin !== self.location.origin) {
+    return true;
+  }
+  
+  // Skip Hugging Face URLs (model files are large and have their own caching)
+  if (url.includes('huggingface.co')) {
+    return true;
+  }
+  
+  // Skip CORS proxy URLs (already handled by model loading code)
+  if (
+    url.includes('api.allorigins.win') ||
+    url.includes('corsproxy.io') ||
+    url.includes('api.codetabs.com') ||
+    url.includes('cors-anywhere.herokuapp.com') ||
+    url.includes('whateverorigin.org')
+  ) {
+    return true;
+  }
+  
+  return false;
+}
+
 // Fetch event - offline-first strategy
 self.addEventListener('fetch', (event) => {
   const { request } = event;
@@ -113,6 +144,12 @@ self.addEventListener('fetch', (event) => {
   
   // Skip chrome-extension and other protocols
   if (!url.protocol.startsWith('http')) {
+    return;
+  }
+  
+  // Skip interception for external URLs (especially large model files)
+  // This prevents timeout issues with long downloads and allows proper error handling
+  if (shouldSkipInterception(request.url)) {
     return;
   }
   
