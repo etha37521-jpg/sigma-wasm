@@ -376,6 +376,27 @@ function validateWasmModuleExports(filePath: string, moduleName: string): void {
 // Plugin to copy public directory to dist during build
 // Vite should copy public/ automatically, but we ensure it happens explicitly
 function copyPublicAssets(): Plugin {
+  const copyPublicDir = (src: string, dest: string): void => {
+    if (!existsSync(src)) {
+      return;
+    }
+
+    mkdirSync(dest, { recursive: true });
+
+    const entries = readdirSync(src, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const srcPath = join(src, entry.name);
+      const destPath = join(dest, entry.name);
+
+      if (entry.isDirectory()) {
+        copyPublicDir(srcPath, destPath);
+      } else {
+        copyFileSync(srcPath, destPath);
+      }
+    }
+  };
+
   return {
     name: 'copy-public-assets',
     writeBundle() {
@@ -394,29 +415,95 @@ function copyPublicAssets(): Plugin {
 
       console.log(`[copy-public-assets] Copying public/ directory to dist/`);
 
-      const copyPublicDir = (src: string, dest: string): void => {
-        if (!existsSync(src)) {
-          return;
-        }
-
-        mkdirSync(dest, { recursive: true });
-
-        const entries = readdirSync(src, { withFileTypes: true });
-
-        for (const entry of entries) {
-          const srcPath = join(src, entry.name);
-          const destPath = join(dest, entry.name);
-
-          if (entry.isDirectory()) {
-            copyPublicDir(srcPath, destPath);
-          } else {
-            copyFileSync(srcPath, destPath);
-          }
-        }
-      };
-
       copyPublicDir(publicDir, distDir);
       console.log(`[copy-public-assets] ✓ Copy complete`);
+    },
+    buildEnd() {
+      // Also run in buildEnd as a fallback to ensure copy happens
+      // This is needed in case writeBundle didn't run or dist/ wasn't created yet
+      const publicDir = resolve(__dirname, 'public');
+      const distDir = resolve(__dirname, 'dist');
+
+      if (!existsSync(publicDir)) {
+        console.warn(`[copy-public-assets] Warning: public/ directory not found at ${publicDir} in buildEnd hook`);
+        return;
+      }
+
+      // Check for expected public assets
+      const iconsDir = join(distDir, 'icons');
+      const manifestPath = join(distDir, 'manifest.json');
+      const swPath = join(distDir, 'sw.js');
+      const faviconPath = join(distDir, 'favicon.ico');
+
+      const iconsExists = existsSync(iconsDir);
+      const manifestExists = existsSync(manifestPath);
+      const swExists = existsSync(swPath);
+      const faviconExists = existsSync(faviconPath);
+
+      console.log(`[copy-public-assets] buildEnd: Checking public assets in dist/`);
+      console.log(`[copy-public-assets] buildEnd: icons/ exists: ${iconsExists}`);
+      console.log(`[copy-public-assets] buildEnd: manifest.json exists: ${manifestExists}`);
+      console.log(`[copy-public-assets] buildEnd: sw.js exists: ${swExists}`);
+      console.log(`[copy-public-assets] buildEnd: favicon.ico exists: ${faviconExists}`);
+
+      // Check if icons directory has content
+      let iconsHasContent = false;
+      if (iconsExists) {
+        try {
+          const iconEntries = readdirSync(iconsDir, { withFileTypes: true });
+          iconsHasContent = iconEntries.length > 0;
+          console.log(`[copy-public-assets] buildEnd: icons/ has ${iconEntries.length} files`);
+        } catch {
+          iconsHasContent = false;
+          console.warn(`[copy-public-assets] buildEnd: Could not read icons/ directory`);
+        }
+      }
+
+      // Determine if we need to copy
+      const needsCopy = !iconsExists || !iconsHasContent || !manifestExists || !swExists || !faviconExists;
+
+      if (needsCopy) {
+        if (!existsSync(distDir)) {
+          console.log(`[copy-public-assets] Fallback: dist/ doesn't exist, creating and copying in buildEnd hook`);
+          mkdirSync(distDir, { recursive: true });
+        } else {
+          console.log(`[copy-public-assets] Fallback: Missing public assets detected, copying in buildEnd hook`);
+          if (iconsExists && !iconsHasContent) {
+            console.log(`[copy-public-assets] Fallback: icons/ exists but is empty, will be overwritten`);
+          }
+        }
+
+        try {
+          copyPublicDir(publicDir, distDir);
+          console.log(`[copy-public-assets] Fallback: ✓ Copy complete`);
+
+          // Verify after copy
+          const iconsExistsAfter = existsSync(iconsDir);
+          const manifestExistsAfter = existsSync(manifestPath);
+          const swExistsAfter = existsSync(swPath);
+          const faviconExistsAfter = existsSync(faviconPath);
+
+          console.log(`[copy-public-assets] Fallback: Verification after copy:`);
+          console.log(`[copy-public-assets] Fallback: icons/ exists: ${iconsExistsAfter}`);
+          console.log(`[copy-public-assets] Fallback: manifest.json exists: ${manifestExistsAfter}`);
+          console.log(`[copy-public-assets] Fallback: sw.js exists: ${swExistsAfter}`);
+          console.log(`[copy-public-assets] Fallback: favicon.ico exists: ${faviconExistsAfter}`);
+
+          if (iconsExistsAfter) {
+            try {
+              const iconEntries = readdirSync(iconsDir, { withFileTypes: true });
+              console.log(`[copy-public-assets] Fallback: icons/ now has ${iconEntries.length} files`);
+            } catch {
+              console.warn(`[copy-public-assets] Fallback: Warning: Could not read icons/ after copy`);
+            }
+          }
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          console.warn(`[copy-public-assets] Fallback: Error copying public assets: ${errorMsg}`);
+        }
+      } else {
+        console.log(`[copy-public-assets] buildEnd: All public assets present, skipping fallback copy`);
+      }
     },
   };
 }
