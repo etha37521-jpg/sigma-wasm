@@ -2435,14 +2435,34 @@ function constraintsToPreConstraints(
     addLogEntry(`Generating Voronoi regions: ${forestSeeds} forest, ${waterSeeds} water, ${grassSeeds} grass seeds`, 'info');
   }
 
-  const voronoiJson = WASM_BABYLON_CHUNKS.wasmModule.generate_voronoi_regions(
-    maxLayer,
-    centerQ,
-    centerR,
-    forestSeeds,
-    waterSeeds,
-    grassSeeds
-  );
+  // Call WASM function with error handling
+  let voronoiJson: string;
+  try {
+    const result = WASM_BABYLON_CHUNKS.wasmModule.generate_voronoi_regions(
+      maxLayer,
+      centerQ,
+      centerR,
+      forestSeeds,
+      waterSeeds,
+      grassSeeds
+    );
+    
+    // Log the actual result type and value for debugging
+    if (addLogEntry !== null) {
+      addLogEntry(`WASM generate_voronoi_regions returned: type=${typeof result}, value=${String(result).substring(0, 100)}`, 'info');
+    }
+    
+    voronoiJson = typeof result === 'string' ? result : '[]';
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+    if (addLogEntry !== null) {
+      addLogEntry(`Error calling generate_voronoi_regions: ${errorMsg}`, 'error');
+      if (error instanceof Error && error.stack) {
+        addLogEntry(`Stack: ${error.stack}`, 'error');
+      }
+    }
+    voronoiJson = '[]';
+  }
 
   // Debug: Log raw JSON for troubleshooting
   if (addLogEntry !== null) {
