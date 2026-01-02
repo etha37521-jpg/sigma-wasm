@@ -3357,59 +3357,69 @@ export const init = async (): Promise<void> => {
       throw new Error('No meshes found in GLB model');
     }
     
-    // Find a mesh with geometry (not a container node)
-    // A mesh with geometry will have geometry property or vertices data
+    // Find a mesh with actual geometry (not a container node)
+    // A mesh with geometry must have vertices data, not just a geometry property
     let baseMesh: Mesh | null = null;
     
-    // Helper to check if mesh has geometry
-    const meshHasGeometry = (mesh: Mesh): boolean => {
-      // Check if mesh has geometry property (BabylonJS meshes with geometry have this)
-      if (mesh.geometry) {
-        return true;
-      }
-      // Check if mesh has vertices data
+    // Helper to find a mesh with actual vertices (recursive)
+    const findMeshWithVertices = (mesh: Mesh): Mesh | null => {
+      // Check if this mesh has actual vertices data
       const positions = mesh.getVerticesData('position');
-      if (positions && positions.length > 0) {
-        return true;
+      const vertexCount = mesh.getTotalVertices();
+      
+      // If this mesh has vertices, return it
+      if (positions && positions.length > 0 && vertexCount > 0) {
+        return mesh;
       }
-      // Check child meshes recursively
+      
+      // Otherwise, check child meshes recursively
       const childMeshes = mesh.getChildMeshes();
       for (const childMesh of childMeshes) {
-        if (childMesh instanceof Mesh && meshHasGeometry(childMesh)) {
-          return true;
+        if (childMesh instanceof Mesh) {
+          const found = findMeshWithVertices(childMesh);
+          if (found) {
+            return found;
+          }
         }
       }
-      return false;
+      
+      return null;
     };
     
-    // Find first mesh with geometry
+    // Find first mesh with actual vertices
     for (const mesh of result.meshes) {
-      if (mesh instanceof Mesh && meshHasGeometry(mesh)) {
-        baseMesh = mesh;
-        break;
-      }
-    }
-    
-    // If no mesh with geometry found, try to find one from children
-    if (!baseMesh) {
-      for (const mesh of result.meshes) {
-        if (mesh instanceof Mesh) {
-          const childMeshes = mesh.getChildMeshes();
-          for (const childMesh of childMeshes) {
-            if (childMesh instanceof Mesh && meshHasGeometry(childMesh)) {
-              baseMesh = childMesh;
-              break;
-            }
-          }
-          if (baseMesh) {
-            break;
-          }
+      if (mesh instanceof Mesh) {
+        const found = findMeshWithVertices(mesh);
+        if (found) {
+          baseMesh = found;
+          break;
         }
       }
     }
     
     if (!baseMesh) {
-      throw new Error('Could not find mesh with geometry in GLB model');
+      // Log all meshes for debugging
+      if (addLogEntry !== null) {
+        addLogEntry(`Failed to find mesh with vertices. Available meshes:`, 'error');
+        for (const mesh of result.meshes) {
+          if (mesh instanceof Mesh) {
+            const vertexCount = mesh.getTotalVertices();
+            const childCount = mesh.getChildMeshes().length;
+            addLogEntry(`  - ${mesh.name}: vertices=${vertexCount}, children=${childCount}`, 'error');
+          }
+        }
+      }
+      throw new Error('Could not find mesh with actual vertices in GLB model');
+    }
+    
+    // Verify the mesh has vertices
+    const vertexCount = baseMesh.getTotalVertices();
+    if (vertexCount === 0) {
+      throw new Error(`Selected mesh "${baseMesh.name}" has 0 vertices - this is a container node, not a geometry mesh`);
+    }
+    
+    if (addLogEntry !== null) {
+      addLogEntry(`Found mesh with geometry: name=${baseMesh.name}, vertices=${vertexCount}`, 'info');
     }
     
     // Use model at its actual size (scale 1.0)
@@ -3451,6 +3461,7 @@ export const init = async (): Promise<void> => {
     
     if (addLogEntry !== null) {
       addLogEntry(`Hex tile model loaded (hexSize: ${TILE_CONFIG.hexSize.toFixed(3)}m, using actual model dimensions ${TILE_CONFIG.modelWidth}m × ${TILE_CONFIG.modelDepth}m, using instancing only)`, 'success');
+      addLogEntry(`Base mesh stored: name=${baseMesh.name}, vertices=${baseMesh.getTotalVertices()}, isVisible=${baseMesh.isVisible}`, 'info');
     }
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : 'Unknown error';
@@ -3555,7 +3566,11 @@ export const init = async (): Promise<void> => {
     // Clear existing thin instances
     const baseMeshForCleanup = baseMeshes.get('base');
     if (baseMeshForCleanup) {
+      const previousCount = baseMeshForCleanup.thinInstanceCount;
       baseMeshForCleanup.thinInstanceCount = 0;
+      if (addLogEntry !== null) {
+        addLogEntry(`Cleared previous thin instances: ${previousCount} → 0`, 'info');
+      }
     }
     
     if (!WASM_BABYLON_CHUNKS.wasmModule) {
@@ -3628,6 +3643,11 @@ export const init = async (): Promise<void> => {
       return;
     }
     
+    // Log base mesh info
+    if (addLogEntry !== null) {
+      addLogEntry(`Base mesh retrieved: name=${baseMesh.name}, vertices=${baseMesh.getTotalVertices()}, currentThinInstanceCount=${baseMesh.thinInstanceCount}`, 'info');
+    }
+    
     // Prepare data for thin instances
     // Collect all valid hex tiles with their positions and colors
     const validHexes: Array<{ hex: { q: number; r: number }; tileType: TileType; worldPos: Vector3 }> = [];
@@ -3656,6 +3676,10 @@ export const init = async (): Promise<void> => {
     
     const numInstances = validHexes.length;
     
+    if (addLogEntry !== null) {
+      addLogEntry(`Mesh grid generation: ${numInstances} valid hexes collected from ${renderHexGrid.length} total hexes`, 'info');
+    }
+    
     if (numInstances === 0) {
       if (addLogEntry !== null) {
         addLogEntry('No valid tiles to render', 'warning');
@@ -3668,6 +3692,10 @@ export const init = async (): Promise<void> => {
     
     // Create color buffer for thin instances (RGBA, 4 components per instance)
     const bufferColors = new Float32Array(numInstances * 4);
+    
+    if (addLogEntry !== null) {
+      addLogEntry(`Mesh grid buffers: matrices=${matrices.length} floats (${numInstances} instances × 16), colors=${bufferColors.length} floats (${numInstances} instances × 4)`, 'info');
+    }
     
     // Populate matrices and colors
     // Get base mesh scaling to preserve model dimensions in thin instances
@@ -3692,29 +3720,65 @@ export const init = async (): Promise<void> => {
       bufferColors[i * 4 + 1] = color.g; // Green
       bufferColors[i * 4 + 2] = color.b; // Blue
       bufferColors[i * 4 + 3] = 1.0;     // Alpha
+      
+      // Log first few instances for debugging
+      if (i < 3 && addLogEntry !== null) {
+        addLogEntry(`Instance ${i}: tileType=${tileType.type}, pos=(${worldPos.x.toFixed(2)}, ${worldPos.y.toFixed(2)}, ${worldPos.z.toFixed(2)}), color=(${color.r.toFixed(2)}, ${color.g.toFixed(2)}, ${color.b.toFixed(2)})`, 'info');
+      }
+    }
+    
+    if (addLogEntry !== null) {
+      addLogEntry(`Populated ${numInstances} instance matrices and colors`, 'info');
     }
     
     // Set up thin instances with matrices using thinInstanceSetBuffer
     // The "matrix" attribute is the standard name for transformation matrices
     baseMesh.thinInstanceSetBuffer("matrix", matrices, 16);
     
+    if (addLogEntry !== null) {
+      addLogEntry(`Thin instance matrix buffer set: ${numInstances} instances, buffer size=${matrices.length}`, 'info');
+    }
+    
+    // Register the color attribute for thin instances (required for per-instance colors)
+    // Use "color" attribute name (not "instanceColor") - this is the standard for thin instances
+    baseMesh.thinInstanceRegisterAttribute("color", 4);
+    
     // Set up thin instances with per-instance colors
-    // Use "instanceColor" attribute name for thin instance colors (BabylonJS standard)
-    baseMesh.thinInstanceSetBuffer("instanceColor", bufferColors, 4);
+    // Use "color" attribute name for thin instance colors (BabylonJS standard)
+    baseMesh.thinInstanceSetBuffer("color", bufferColors, 4);
+    
+    if (addLogEntry !== null) {
+      addLogEntry(`Thin instance color buffer set: ${numInstances} instances, buffer size=${bufferColors.length}`, 'info');
+    }
     
     // Set thin instance count after setting buffers (required for thin instances to render)
     baseMesh.thinInstanceCount = numInstances;
     
+    if (addLogEntry !== null) {
+      addLogEntry(`Thin instance count set: ${baseMesh.thinInstanceCount} (expected: ${numInstances})`, 'info');
+    }
+    
     // Apply a base material to the mesh
-    // PBRMaterial supports per-instance colors with thin instances automatically
+    // PBRMaterial supports per-instance colors with thin instances when color attribute is registered
     const baseMaterial = materials.get('grass');
     if (baseMaterial) {
       baseMesh.material = baseMaterial;
+      if (addLogEntry !== null) {
+        addLogEntry(`Base material applied: ${baseMaterial.name}`, 'info');
+      }
+    } else {
+      if (addLogEntry !== null) {
+        addLogEntry('Warning: No base material found for thin instances', 'warning');
+      }
     }
     
     // Make the base mesh visible so thin instances render
     // Thin instances are rendered as part of the base mesh
     baseMesh.isVisible = true;
+    
+    if (addLogEntry !== null) {
+      addLogEntry(`Base mesh visibility set: isVisible=${baseMesh.isVisible}, thinInstanceCount=${baseMesh.thinInstanceCount}`, 'info');
+    }
     
     const renderedCount = numInstances;
     
