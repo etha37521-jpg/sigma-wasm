@@ -942,7 +942,7 @@ pub fn init() {
 /// Update this version when making significant changes to help debug caching issues.
 #[wasm_bindgen]
 pub fn get_wasm_version() -> String {
-    "1.0.0-20250102-0912".to_string()
+    "1.1.0-20250102-performance".to_string()
 }
 
 /// Generate a simplified layout using pre-constraints
@@ -1309,6 +1309,666 @@ pub fn generate_road_network_growing_tree(
     let mut json_parts = Vec::new();
     for (q, r) in road_vec {
         json_parts.push(format!(r#"{{"q":{},"r":{}}}"#, q, r));
+    }
+    
+    format!("[{}]", json_parts.join(","))
+}
+
+/// Calculate chunk radius for distance threshold calculations
+/// The chunk radius is the distance from chunk center to the outer boundary
+/// 
+/// @param rings - Number of rings per chunk
+/// @returns Chunk radius in hex distance units
+#[wasm_bindgen]
+pub fn calculate_chunk_radius(rings: i32) -> i32 {
+    rings
+}
+
+/// Calculate chunk neighbor positions using offset vector rotation
+/// Returns exactly 6 neighbor hex coordinates, one in each of the 6 directions
+/// 
+/// Uses the offset vector (rings, rings+1) for rings>0, or (1, 0) for rings=0, and rotates
+/// it 60 degrees clockwise 6 times. This ensures chunks are packed without gaps - 
+/// each direction has exactly one neighbor. The outer boundaries of adjacent chunks touch.
+/// 
+/// @param center_q - Center q coordinate
+/// @param center_r - Center r coordinate
+/// @param rings - Number of rings per chunk
+/// @returns JSON string with array of 6 neighbor coordinates: [{"q":0,"r":0},...]
+#[wasm_bindgen]
+pub fn calculate_chunk_neighbors(center_q: i32, center_r: i32, rings: i32) -> String {
+    let mut neighbors = Vec::new();
+    
+    // Base offset vector: (rings, rings+1) for rings>0, or (1, 0) for rings=0
+    let (mut offset_q, mut offset_r) = if rings == 0 {
+        (1, 0)
+    } else {
+        (rings, rings + 1)
+    };
+    
+    // Rotate the starting offset by -120 degrees (4 steps clockwise) to correct angular alignment
+    // This compensates for the 120-degree offset in the coordinate system
+    for _i in 0..4 {
+        let next_q = offset_q + offset_r;
+        let next_r = -offset_q;
+        offset_q = next_q;
+        offset_r = next_r;
+    }
+    
+    // Rotate the offset vector 60 degrees clockwise 6 times
+    // Rotation formula in axial coordinates for clockwise: (q, r) -> (q+r, -q)
+    let mut current_q = offset_q;
+    let mut current_r = offset_r;
+    
+    for _i in 0..6 {
+        // Add the current offset to the center
+        neighbors.push((center_q + current_q, center_r + current_r));
+        
+        // Rotate 60 degrees clockwise: (q, r) -> (q+r, -q)
+        let next_q = current_q + current_r;
+        let next_r = -current_q;
+        current_q = next_q;
+        current_r = next_r;
+    }
+    
+    // Convert to JSON
+    let mut json_parts = Vec::new();
+    for (q, r) in neighbors {
+        json_parts.push(format!(r#"{{"q":{},"r":{}}}"#, q, r));
+    }
+    
+    format!("[{}]", json_parts.join(","))
+}
+
+/// Find the immediate neighbor chunk of the current chunk that is nearest to the current tile
+/// Only considers the 6 immediate neighbors of the current chunk
+/// 
+/// @param current_chunk_q - Hex q coordinate of current chunk
+/// @param current_chunk_r - Hex r coordinate of current chunk
+/// @param current_tile_q - Hex q coordinate of current tile
+/// @param current_tile_r - Hex r coordinate of current tile
+/// @param rings - Number of rings per chunk
+/// @param existing_chunks_json - JSON array of existing chunk positions: [{"q":0,"r":0},...]
+/// @returns JSON string with nearest neighbor info: {"neighbor":{"q":0,"r":0},"distance":1.5,"isInstantiated":true} or "null"
+#[wasm_bindgen]
+pub fn find_nearest_neighbor_chunk(
+    current_chunk_q: i32,
+    current_chunk_r: i32,
+    current_tile_q: i32,
+    current_tile_r: i32,
+    rings: i32,
+    existing_chunks_json: String,
+) -> String {
+    // Parse existing chunks
+    let existing_chunks = parse_valid_terrain_json(&existing_chunks_json);
+    
+    // Calculate immediate neighbors
+    let neighbors_json = calculate_chunk_neighbors(current_chunk_q, current_chunk_r, rings);
+    let neighbors = parse_valid_terrain_json(&neighbors_json);
+    
+    if neighbors.is_empty() {
+        return "null".to_string();
+    }
+    
+    // Find which of the immediate neighbors is closest to the current tile (in hex distance)
+    let mut nearest_neighbor: Option<(i32, i32)> = None;
+    let mut min_distance = i32::MAX;
+    
+    for neighbor_pos in &neighbors {
+        let hex_dist = hex_distance(current_tile_q, current_tile_r, neighbor_pos.0, neighbor_pos.1);
+        
+        if hex_dist < min_distance {
+            min_distance = hex_dist;
+            nearest_neighbor = Some(*neighbor_pos);
+        }
+    }
+    
+    if let Some(neighbor) = nearest_neighbor {
+        let is_instantiated = existing_chunks.contains(&neighbor);
+        // Return distance as hex distance (TypeScript will convert to world distance if needed)
+        format!(
+            r#"{{"neighbor":{{"q":{},"r":{}}},"distance":{},"isInstantiated":{}}}"#,
+            neighbor.0, neighbor.1, min_distance, is_instantiated
+        )
+    } else {
+        "null".to_string()
+    }
+}
+
+/// Disable chunks that are more than max_distance away from the current chunk
+/// All chunks, including the origin chunk, are subject to the distance threshold
+/// 
+/// @param current_chunk_q - Hex q coordinate of current chunk
+/// @param current_chunk_r - Hex r coordinate of current chunk
+/// @param all_chunks_json - JSON array of all chunk positions with enabled state: [{"q":0,"r":0,"enabled":true},...]
+/// @param max_distance - Maximum hex distance threshold
+/// @returns JSON string with chunks to enable/disable: {"toDisable":[{"q":0,"r":0},...],"toEnable":[{"q":0,"r":0},...]}
+#[wasm_bindgen]
+pub fn disable_distant_chunks(
+    current_chunk_q: i32,
+    current_chunk_r: i32,
+    all_chunks_json: String,
+    max_distance: i32,
+) -> String {
+    // Parse chunks with enabled state
+    // Format: [{"q":0,"r":0,"enabled":true},...]
+    let mut chunks: Vec<(i32, i32, bool)> = Vec::new();
+    
+    let trimmed = all_chunks_json.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return r#"{"toDisable":[],"toEnable":[]}"#.to_string();
+    }
+    
+    // Simple JSON parsing: find all {"q":X,"r":Y,"enabled":Z} patterns
+    let mut i = 0;
+    let chars: Vec<char> = trimmed.chars().collect();
+    while i < chars.len() {
+        if chars[i] == '{' {
+            let mut q_value: Option<i32> = None;
+            let mut r_value: Option<i32> = None;
+            let mut enabled_value: Option<bool> = None;
+            
+            i += 1;
+            while i < chars.len() && chars[i] != '}' {
+                // Look for "q", "r", or "enabled"
+                if i + 3 < chars.len() && chars[i] == '"' && chars[i + 1] == 'q' && chars[i + 2] == '"' {
+                    i += 3;
+                    while i < chars.len() && (chars[i] == ':' || chars[i] == ' ' || chars[i] == '\t') {
+                        i += 1;
+                    }
+                    if i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '-') {
+                        let start = i;
+                        i += 1;
+                        while i < chars.len() && chars[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        let num_str: String = chars[start..i].iter().collect();
+                        if let Ok(num) = num_str.parse::<i32>() {
+                            q_value = Some(num);
+                        }
+                    }
+                } else if i + 3 < chars.len() && chars[i] == '"' && chars[i + 1] == 'r' && chars[i + 2] == '"' {
+                    i += 3;
+                    while i < chars.len() && (chars[i] == ':' || chars[i] == ' ' || chars[i] == '\t') {
+                        i += 1;
+                    }
+                    if i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '-') {
+                        let start = i;
+                        i += 1;
+                        while i < chars.len() && chars[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        let num_str: String = chars[start..i].iter().collect();
+                        if let Ok(num) = num_str.parse::<i32>() {
+                            r_value = Some(num);
+                        }
+                    }
+                } else if i + 9 < chars.len() && chars[i] == '"' && chars[i + 1] == 'e' && chars[i + 2] == 'n' 
+                    && chars[i + 3] == 'a' && chars[i + 4] == 'b' && chars[i + 5] == 'l' 
+                    && chars[i + 6] == 'e' && chars[i + 7] == 'd' && chars[i + 8] == '"' {
+                    i += 9;
+                    while i < chars.len() && (chars[i] == ':' || chars[i] == ' ' || chars[i] == '\t') {
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        if i + 4 < chars.len() && chars[i] == 't' && chars[i + 1] == 'r' 
+                            && chars[i + 2] == 'u' && chars[i + 3] == 'e' {
+                            enabled_value = Some(true);
+                            i += 4;
+                        } else if i + 5 < chars.len() && chars[i] == 'f' && chars[i + 1] == 'a' 
+                            && chars[i + 2] == 'l' && chars[i + 3] == 's' && chars[i + 4] == 'e' {
+                            enabled_value = Some(false);
+                            i += 5;
+                        }
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            
+            if let (Some(q), Some(r), Some(enabled)) = (q_value, r_value, enabled_value) {
+                chunks.push((q, r, enabled));
+            }
+        }
+        i += 1;
+    }
+    
+    // Calculate which chunks to disable/enable
+    let mut to_disable: Vec<(i32, i32)> = Vec::new();
+    let mut to_enable: Vec<(i32, i32)> = Vec::new();
+    
+    for (chunk_q, chunk_r, currently_enabled) in chunks {
+        let distance = hex_distance(current_chunk_q, current_chunk_r, chunk_q, chunk_r);
+        
+        if distance > max_distance {
+            if currently_enabled {
+                to_disable.push((chunk_q, chunk_r));
+            }
+        } else {
+            if !currently_enabled {
+                to_enable.push((chunk_q, chunk_r));
+            }
+        }
+    }
+    
+    // Build JSON response
+    let mut disable_parts = Vec::new();
+    for (q, r) in &to_disable {
+        disable_parts.push(format!(r#"{{"q":{},"r":{}}}"#, q, r));
+    }
+    
+    let mut enable_parts = Vec::new();
+    for (q, r) in &to_enable {
+        enable_parts.push(format!(r#"{{"q":{},"r":{}}}"#, q, r));
+    }
+    
+    format!(
+        r#"{{"toDisable":[{}],"toEnable":[{}]}}"#,
+        disable_parts.join(","),
+        enable_parts.join(",")
+    )
+}
+
+/// Batch query tile types for multiple hex coordinates
+/// Returns JSON array with tile types: [{"q":0,"r":0,"tileType":1},...]
+/// 
+/// @param hex_coords_json - JSON array of hex coordinates: [{"q":0,"r":0},...]
+/// @returns JSON array with tile types for each coordinate
+#[wasm_bindgen]
+pub fn batch_get_tile_types(hex_coords_json: String) -> String {
+    let state = WFC_STATE.lock().unwrap();
+    
+    // Parse hex coordinates
+    let hex_coords = parse_valid_terrain_json(&hex_coords_json);
+    
+    let mut json_parts = Vec::new();
+    for (q, r) in hex_coords {
+        if let Some(tile) = state.get_tile(q, r) {
+            json_parts.push(format!(
+                r#"{{"q":{},"r":{},"tileType":{}}}"#,
+                q, r, tile as i32
+            ));
+        }
+    }
+    
+    format!("[{}]", json_parts.join(","))
+}
+
+/// Calculate which chunk contains a given tile
+/// Returns chunk position that contains the tile, or null if not found
+/// 
+/// @param tile_q - Hex q coordinate of the tile
+/// @param tile_r - Hex r coordinate of the tile
+/// @param rings - Number of rings per chunk
+/// @param chunk_positions_json - JSON array of chunk positions: [{"q":0,"r":0},...]
+/// @returns JSON string with chunk position: {"q":0,"r":0} or "null"
+#[wasm_bindgen]
+pub fn calculate_chunk_for_tile(
+    tile_q: i32,
+    tile_r: i32,
+    rings: i32,
+    chunk_positions_json: String,
+) -> String {
+    // Parse chunk positions
+    let chunk_positions = parse_valid_terrain_json(&chunk_positions_json);
+    
+    if chunk_positions.is_empty() {
+        return "null".to_string();
+    }
+    
+    let mut closest_chunk: Option<(i32, i32)> = None;
+    let mut min_distance = i32::MAX;
+    
+    // Find chunk whose center is closest to the tile and within the chunk's boundary
+    for chunk_pos in &chunk_positions {
+        let distance = hex_distance(tile_q, tile_r, chunk_pos.0, chunk_pos.1);
+        
+        // If tile is exactly at chunk center, return immediately
+        if distance == 0 {
+            return format!(r#"{{"q":{},"r":{}}}"#, chunk_pos.0, chunk_pos.1);
+        }
+        
+        // Check if tile is within this chunk's boundary (distance <= rings)
+        if distance <= rings {
+            // If multiple chunks contain this tile (overlap at boundaries), prefer the closest center
+            if distance < min_distance {
+                min_distance = distance;
+                closest_chunk = Some(*chunk_pos);
+            }
+        }
+    }
+    
+    if let Some(chunk) = closest_chunk {
+        format!(r#"{{"q":{},"r":{}}}"#, chunk.0, chunk.1)
+    } else {
+        "null".to_string()
+    }
+}
+
+/// Shuffle array in WASM using Fisher-Yates algorithm
+/// Returns shuffled JSON array
+/// 
+/// @param array_json - JSON array to shuffle: [{"q":0,"r":0},...]
+/// @returns Shuffled JSON array
+#[wasm_bindgen]
+pub fn shuffle_array(array_json: String) -> String {
+    // Parse array
+    let mut coords: Vec<(i32, i32)> = Vec::new();
+    
+    let trimmed = array_json.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return "[]".to_string();
+    }
+    
+    // Simple JSON parsing: find all {"q":X,"r":Y} patterns
+    let mut i = 0;
+    let chars: Vec<char> = trimmed.chars().collect();
+    while i < chars.len() {
+        if chars[i] == '{' {
+            let mut q_value: Option<i32> = None;
+            let mut r_value: Option<i32> = None;
+            
+            i += 1;
+            while i < chars.len() && chars[i] != '}' {
+                if i + 3 < chars.len() && chars[i] == '"' && chars[i + 1] == 'q' && chars[i + 2] == '"' {
+                    i += 3;
+                    while i < chars.len() && (chars[i] == ':' || chars[i] == ' ' || chars[i] == '\t') {
+                        i += 1;
+                    }
+                    if i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '-') {
+                        let start = i;
+                        i += 1;
+                        while i < chars.len() && chars[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        let num_str: String = chars[start..i].iter().collect();
+                        if let Ok(num) = num_str.parse::<i32>() {
+                            q_value = Some(num);
+                        }
+                    }
+                } else if i + 3 < chars.len() && chars[i] == '"' && chars[i + 1] == 'r' && chars[i + 2] == '"' {
+                    i += 3;
+                    while i < chars.len() && (chars[i] == ':' || chars[i] == ' ' || chars[i] == '\t') {
+                        i += 1;
+                    }
+                    if i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '-') {
+                        let start = i;
+                        i += 1;
+                        while i < chars.len() && chars[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        let num_str: String = chars[start..i].iter().collect();
+                        if let Ok(num) = num_str.parse::<i32>() {
+                            r_value = Some(num);
+                        }
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            
+            if let (Some(q), Some(r)) = (q_value, r_value) {
+                coords.push((q, r));
+            }
+        }
+        i += 1;
+    }
+    
+    // Fisher-Yates shuffle using a simple PRNG
+    // Use a deterministic seed based on array content for reproducibility
+    let mut seed: u64 = 0;
+    for (q, r) in &coords {
+        seed = seed.wrapping_mul(31).wrapping_add((*q as u64).wrapping_mul(17).wrapping_add(*r as u64));
+    }
+    
+    let mut rng_state = seed;
+    let mut rng = || {
+        rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
+        rng_state
+    };
+    
+    for i in (1..coords.len()).rev() {
+        let j = (rng() % (i as u64 + 1)) as usize;
+        coords.swap(i, j);
+    }
+    
+    // Convert back to JSON
+    let mut json_parts = Vec::new();
+    for (q, r) in coords {
+        json_parts.push(format!(r#"{{"q":{},"r":{}}}"#, q, r));
+    }
+    
+    format!("[{}]", json_parts.join(","))
+}
+
+/// Count adjacent roads for a given hex coordinate
+/// 
+/// @param hex_q - Hex q coordinate
+/// @param hex_r - Hex r coordinate
+/// @param road_network_json - JSON array of road coordinates: [{"q":0,"r":0},...]
+/// @returns Number of adjacent roads (0-6)
+#[wasm_bindgen]
+pub fn count_adjacent_roads(hex_q: i32, hex_r: i32, road_network_json: String) -> i32 {
+    let roads = parse_valid_terrain_json(&road_network_json);
+    let roads_set: HashSet<(i32, i32)> = roads.iter().cloned().collect();
+    
+    let neighbors = get_hex_neighbors(hex_q, hex_r);
+    let mut count = 0;
+    
+    for (nq, nr) in neighbors {
+        if roads_set.contains(&(nq, nr)) {
+            count += 1;
+        }
+    }
+    
+    count
+}
+
+/// Get all valid terrain hexes adjacent to existing roads
+/// Returns array of hex coordinates that are:
+/// - Adjacent to at least one road in the network
+/// - On valid terrain (in valid_terrain_json)
+/// - Not already occupied
+/// 
+/// @param road_network_json - JSON array of road coordinates: [{"q":0,"r":0},...]
+/// @param valid_terrain_json - JSON array of valid terrain: [{"q":0,"r":0},...]
+/// @param occupied_json - JSON array of occupied hexes: [{"q":0,"r":0},...]
+/// @returns JSON array of adjacent valid terrain: [{"q":0,"r":0},...]
+#[wasm_bindgen]
+pub fn get_adjacent_valid_terrain(
+    road_network_json: String,
+    valid_terrain_json: String,
+    occupied_json: String,
+) -> String {
+    let roads = parse_valid_terrain_json(&road_network_json);
+    let valid_terrain = parse_valid_terrain_json(&valid_terrain_json);
+    let occupied = parse_valid_terrain_json(&occupied_json);
+    
+    let roads_set: HashSet<(i32, i32)> = roads.iter().cloned().collect();
+    let valid_terrain_set: HashSet<(i32, i32)> = valid_terrain.iter().cloned().collect();
+    let occupied_set: HashSet<(i32, i32)> = occupied.iter().cloned().collect();
+    
+    let mut adjacent_hexes: HashSet<(i32, i32)> = HashSet::new();
+    
+    // For each road, find its neighbors
+    for (road_q, road_r) in roads {
+        let neighbors = get_hex_neighbors(road_q, road_r);
+        for (nq, nr) in neighbors {
+            let neighbor_key = (nq, nr);
+            
+            // Skip if already a road
+            if roads_set.contains(&neighbor_key) {
+                continue;
+            }
+            
+            // Skip if occupied
+            if occupied_set.contains(&neighbor_key) {
+                continue;
+            }
+            
+            // Check if this neighbor is in valid terrain
+            if valid_terrain_set.contains(&neighbor_key) {
+                adjacent_hexes.insert(neighbor_key);
+            }
+        }
+    }
+    
+    // Convert to JSON
+    let mut adjacent_vec: Vec<(i32, i32)> = adjacent_hexes.iter().cloned().collect();
+    adjacent_vec.sort();
+    
+    let mut json_parts = Vec::new();
+    for (q, r) in adjacent_vec {
+        json_parts.push(format!(r#"{{"q":{},"r":{}}}"#, q, r));
+    }
+    
+    format!("[{}]", json_parts.join(","))
+}
+
+/// Generate building placement on valid terrain adjacent to roads
+/// 
+/// @param valid_terrain_json - JSON array of valid terrain: [{"q":0,"r":0},...]
+/// @param road_network_json - JSON array of road coordinates: [{"q":0,"r":0},...]
+/// @param occupied_json - JSON array of occupied hexes: [{"q":0,"r":0},...]
+/// @param building_rules_json - JSON string with building rules: {"minAdjacentRoads":1}
+/// @param target_count - Target number of buildings to place
+/// @returns JSON array of building positions: [{"q":0,"r":0},...]
+#[wasm_bindgen]
+pub fn generate_building_placement(
+    valid_terrain_json: String,
+    road_network_json: String,
+    occupied_json: String,
+    building_rules_json: String,
+    target_count: i32,
+) -> String {
+    let valid_terrain = parse_valid_terrain_json(&valid_terrain_json);
+    let roads = parse_valid_terrain_json(&road_network_json);
+    let occupied = parse_valid_terrain_json(&occupied_json);
+    
+    let roads_set: HashSet<(i32, i32)> = roads.iter().cloned().collect();
+    let occupied_set: HashSet<(i32, i32)> = occupied.iter().cloned().collect();
+    
+    // Parse building rules
+    let mut min_adjacent_roads = 1;
+    let trimmed_rules = building_rules_json.trim();
+    if !trimmed_rules.is_empty() && trimmed_rules != "{}" {
+        // Simple JSON parsing for minAdjacentRoads
+        let chars: Vec<char> = trimmed_rules.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if i + 18 < chars.len() && chars[i] == '"' && chars[i + 1] == 'm' && chars[i + 2] == 'i' 
+                && chars[i + 3] == 'n' && chars[i + 4] == 'A' && chars[i + 5] == 'd' 
+                && chars[i + 6] == 'j' && chars[i + 7] == 'a' && chars[i + 8] == 'c' 
+                && chars[i + 9] == 'e' && chars[i + 10] == 'n' && chars[i + 11] == 't' 
+                && chars[i + 12] == 'R' && chars[i + 13] == 'o' && chars[i + 14] == 'a' 
+                && chars[i + 15] == 'd' && chars[i + 16] == 's' && chars[i + 17] == '"' {
+                i += 18;
+                while i < chars.len() && (chars[i] == ':' || chars[i] == ' ' || chars[i] == '\t') {
+                    i += 1;
+                }
+                if i < chars.len() && chars[i].is_ascii_digit() {
+                    let start = i;
+                    i += 1;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    let num_str: String = chars[start..i].iter().collect();
+                    if let Ok(num) = num_str.parse::<i32>() {
+                        min_adjacent_roads = num;
+                    }
+                }
+                break;
+            }
+            i += 1;
+        }
+    }
+    
+    // Find available hexes for buildings
+    let mut available_building_hexes: Vec<(i32, i32)> = Vec::new();
+    
+    for (terrain_q, terrain_r) in &valid_terrain {
+        let terrain_key = (*terrain_q, *terrain_r);
+        
+        // Skip if occupied
+        if occupied_set.contains(&terrain_key) {
+            continue;
+        }
+        
+        // Count adjacent roads
+        let neighbors = get_hex_neighbors(*terrain_q, *terrain_r);
+        let mut adjacent_road_count = 0;
+        for (nq, nr) in neighbors {
+            if roads_set.contains(&(nq, nr)) {
+                adjacent_road_count += 1;
+            }
+        }
+        
+        // Check if meets minimum adjacent roads requirement
+        if adjacent_road_count >= min_adjacent_roads {
+            available_building_hexes.push(terrain_key);
+        }
+    }
+    
+    // Shuffle available building hexes
+    if available_building_hexes.len() > 1 {
+        // Use deterministic seed based on content
+        let mut seed: u64 = 0;
+        for (q, r) in &available_building_hexes {
+            seed = seed.wrapping_mul(31).wrapping_add((*q as u64).wrapping_mul(17).wrapping_add(*r as u64));
+        }
+        
+        let mut rng_state = seed;
+        let mut rng = || {
+            rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
+            rng_state
+        };
+        
+        for i in (1..available_building_hexes.len()).rev() {
+            let j = (rng() % (i as u64 + 1)) as usize;
+            available_building_hexes.swap(i, j);
+        }
+    }
+    
+    // Limit to target count
+    let building_count = target_count.min(available_building_hexes.len() as i32);
+    let selected_buildings = &available_building_hexes[0..(building_count as usize)];
+    
+    // Convert to JSON
+    let mut json_parts = Vec::new();
+    for (q, r) in selected_buildings {
+        json_parts.push(format!(r#"{{"q":{},"r":{}}}"#, q, r));
+    }
+    
+    format!("[{}]", json_parts.join(","))
+}
+
+/// Batch convert hex coordinates to world positions
+/// 
+/// @param hex_coords_json - JSON array of hex coordinates: [{"q":0,"r":0},...]
+/// @param hex_size - Size of hexagon for coordinate conversion
+/// @returns JSON array with world positions: [{"q":0,"r":0,"x":0.0,"z":0.0},...]
+#[wasm_bindgen]
+pub fn batch_hex_to_world(hex_coords_json: String, hex_size: f64) -> String {
+    let hex_coords = parse_valid_terrain_json(&hex_coords_json);
+    
+    // Formula for pointy-top hexagons:
+    // x = size * (√3 * q + √3/2 * r)
+    // z = size * (3/2 * r)
+    // Adjusted for the scaling factor used in TypeScript (hexSize / 1.34)
+    let adjusted_hex_size = hex_size / 1.34;
+    let sqrt3 = 3.0_f64.sqrt();
+    
+    let mut json_parts = Vec::new();
+    for (q, r) in hex_coords {
+        let q_f = q as f64;
+        let r_f = r as f64;
+        let x = adjusted_hex_size * (sqrt3 * 2.0 * q_f + sqrt3 * r_f);
+        let z = adjusted_hex_size * (3.0 * r_f);
+        
+        json_parts.push(format!(
+            r#"{{"q":{},"r":{},"x":{},"z":{}}}"#,
+            q, r, x, z
+        ));
     }
     
     format!("[{}]", json_parts.join(","))
