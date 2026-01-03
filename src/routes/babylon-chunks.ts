@@ -21,6 +21,18 @@ import { PatternCacheManager } from './babylon-chunks/dbManagement';
 import { LlmManager } from './babylon-chunks/llmManagement';
 import { CanvasManager } from './babylon-chunks/canvasManagement';
 import { generateLayoutFromText, constraintsToPreConstraints } from './babylon-chunks/layoutGeneration';
+import { WorldMap } from './babylon-chunks/chunkManagement';
+import { TestManager } from './babylon-chunks/testManagement';
+import { TILE_CONFIG } from './babylon-chunks/canvasManagement';
+
+/**
+ * Runtime Configuration
+ */
+type ConfigMode = 'normal' | 'test';
+
+const CONFIG: { mode: ConfigMode } = {
+  mode: 'test',
+};
 
 /**
  * Initialize the babylon-chunks route
@@ -69,7 +81,19 @@ export const init = async (): Promise<void> => {
     addLogEntry ?? undefined,
     (text: string) => llmManager.generateEmbedding(text)
   );
-  const canvasManager = new CanvasManager(wasmManager, addLogEntry ?? undefined);
+  
+  // Get initial rings value from dropdown (default 5)
+  const initialRingsSelectEl = document.getElementById('ringsSelect');
+  let initialRings = 5; // Default value
+  if (initialRingsSelectEl && initialRingsSelectEl instanceof HTMLSelectElement) {
+    const selectedRings = Number.parseInt(initialRingsSelectEl.value, 10);
+    if (!Number.isNaN(selectedRings) && selectedRings >= 0 && selectedRings <= 50) {
+      initialRings = selectedRings;
+    }
+  }
+  
+  const canvasManager = new CanvasManager(wasmManager, addLogEntry ?? undefined, undefined, CONFIG.mode === 'test');
+  canvasManager.setCurrentRings(initialRings);
 
   // Set up pre-constraints generation function for canvas manager
   canvasManager.setGeneratePreConstraintsFn((constraints: LayoutConstraints) => {
@@ -134,6 +158,44 @@ export const init = async (): Promise<void> => {
   // Initialize canvas manager
   await canvasManager.initialize(canvas);
   
+  // Set initial background color from dropdown
+  const initialBackgroundColorSelectEl = document.getElementById('backgroundColorSelect');
+  if (initialBackgroundColorSelectEl && initialBackgroundColorSelectEl instanceof HTMLSelectElement) {
+    canvasManager.setBackgroundColor(initialBackgroundColorSelectEl.value);
+  }
+  
+  // Create map for chunk management
+  const worldMap = new WorldMap();
+  
+  // Create origin chunk at (0, 0)
+  const originPosition = { q: 0, r: 0 };
+  const originChunk = worldMap.createChunk(
+    originPosition,
+    canvasManager.getCurrentRings(),
+    TILE_CONFIG.hexSize
+  );
+  
+  // Compute neighbors for origin chunk (already computed in constructor)
+  if (addLogEntry) {
+    const neighbors = originChunk.getNeighbors();
+    addLogEntry(`Origin chunk created at (0, 0) with ${neighbors.length} neighbors`, 'info');
+    for (const neighbor of neighbors) {
+      addLogEntry(`Origin chunk neighbor: (${neighbor.q}, ${neighbor.r})`, 'info');
+    }
+  }
+  
+  // Run tests if mode is test
+  if (CONFIG.mode === 'test') {
+    const testManager = new TestManager(worldMap, addLogEntry ?? undefined);
+    testManager.testOriginChunkNeighborsWithCreation(
+      canvasManager.getCurrentRings(),
+      TILE_CONFIG.hexSize
+    );
+  }
+  
+  // Set map in canvas manager for rendering
+  canvasManager.setMap(worldMap);
+  
   // Initial render
   canvasManager.renderGrid();
   
@@ -166,6 +228,116 @@ export const init = async (): Promise<void> => {
     });
   }
 
+  /**
+   * Reinitialize everything - called when rings or mode changes
+   */
+  const reinitialize = async (): Promise<void> => {
+    try {
+      // Get current rings value from dropdown
+      const ringsSelectEl = document.getElementById('ringsSelect');
+      let currentRings = canvasManager.getCurrentRings();
+      if (ringsSelectEl && ringsSelectEl instanceof HTMLSelectElement) {
+        const selectedRings = Number.parseInt(ringsSelectEl.value, 10);
+        if (!Number.isNaN(selectedRings) && selectedRings >= 0 && selectedRings <= 50) {
+          currentRings = selectedRings;
+        }
+      }
+
+      // Clear system logs
+      if (systemLogsContentEl) {
+        systemLogsContentEl.innerHTML = '';
+      }
+
+      // Dispose of old canvas manager
+      canvasManager.dispose();
+
+      // Clear WASM state
+      const wasmModule = wasmManager.getModule();
+      if (wasmModule) {
+        wasmModule.clear_layout();
+        wasmModule.clear_pre_constraints();
+      }
+
+      // Create new canvas manager with updated test mode
+      const newCanvasManager = new CanvasManager(wasmManager, addLogEntry ?? undefined, undefined, CONFIG.mode === 'test');
+      
+      // Set the rings value before initialization
+      newCanvasManager.setCurrentRings(currentRings);
+
+      // Set up pre-constraints generation function
+      newCanvasManager.setGeneratePreConstraintsFn((constraints: LayoutConstraints) => {
+        const module = wasmManager.getModule();
+        if (!module) {
+          return [];
+        }
+        return constraintsToPreConstraints(
+          constraints,
+          module,
+          newCanvasManager.getCurrentRings(),
+          (rings) => newCanvasManager.setCurrentRings(rings),
+          addLogEntry ?? undefined
+        );
+      });
+
+      // Initialize canvas manager
+      await newCanvasManager.initialize(canvas);
+
+      // Set background color from dropdown
+      const backgroundColorSelectEl = document.getElementById('backgroundColorSelect');
+      if (backgroundColorSelectEl && backgroundColorSelectEl instanceof HTMLSelectElement) {
+        newCanvasManager.setBackgroundColor(backgroundColorSelectEl.value);
+      }
+
+      // Create new map for chunk management
+      const newWorldMap = new WorldMap();
+
+      // Create origin chunk at (0, 0) with current rings value
+      const originPosition = { q: 0, r: 0 };
+      const originChunk = newWorldMap.createChunk(
+        originPosition,
+        currentRings,
+        TILE_CONFIG.hexSize
+      );
+
+      // Compute neighbors for origin chunk
+      if (addLogEntry) {
+        const neighbors = originChunk.getNeighbors();
+        addLogEntry(`Origin chunk created at (0, 0) with ${neighbors.length} neighbors (rings: ${currentRings})`, 'info');
+        for (const neighbor of neighbors) {
+          addLogEntry(`Origin chunk neighbor: (${neighbor.q}, ${neighbor.r})`, 'info');
+        }
+      }
+
+      // Run tests if mode is test - use current rings value
+      if (CONFIG.mode === 'test') {
+        const testManager = new TestManager(newWorldMap, addLogEntry ?? undefined);
+        testManager.testOriginChunkNeighborsWithCreation(
+          currentRings,
+          TILE_CONFIG.hexSize
+        );
+      }
+
+      // Set map in canvas manager for rendering
+      newCanvasManager.setMap(newWorldMap);
+
+      // Initial render
+      newCanvasManager.renderGrid();
+
+      // Update the canvasManager reference
+      // Note: We can't reassign const, so we'll need to update the handlers
+      // For now, we'll store it in a way that allows updates
+      Object.assign(canvasManager, newCanvasManager);
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      if (errorEl) {
+        errorEl.textContent = `Reinitialization error: ${errorMsg}`;
+      }
+      if (addLogEntry) {
+        addLogEntry(`Reinitialization error: ${errorMsg}`, 'error');
+      }
+    }
+  };
+
   // Rings dropdown handler
   const ringsSelectEl = document.getElementById('ringsSelect');
   if (ringsSelectEl && ringsSelectEl instanceof HTMLSelectElement) {
@@ -178,21 +350,40 @@ export const init = async (): Promise<void> => {
         // Update rings in canvas manager
         canvasManager.setCurrentRings(selectedRings);
         
-        // Reset camera to initial position and rotation from config
-        canvasManager.resetCamera();
-        
-        // Clear all state
-        const wasmModule = wasmManager.getModule();
-        if (wasmModule) {
-          // Clear WASM grid
-          wasmModule.clear_layout();
-          // Clear pre-constraints
-          wasmModule.clear_pre_constraints();
-        }
-        
-        // Re-render with new rings
-        canvasManager.renderGrid();
+        // Reinitialize everything
+        void reinitialize();
       }
+    });
+  }
+
+  // Runtime mode dropdown handler
+  const runtimeModeSelectEl = document.getElementById('runtimeModeSelect');
+  if (runtimeModeSelectEl && runtimeModeSelectEl instanceof HTMLSelectElement) {
+    // Set initial value to current mode
+    runtimeModeSelectEl.value = CONFIG.mode;
+    
+    runtimeModeSelectEl.addEventListener('change', () => {
+      const selectedMode = runtimeModeSelectEl.value;
+      if (selectedMode === 'normal' || selectedMode === 'test') {
+        // Update CONFIG mode
+        CONFIG.mode = selectedMode;
+        
+        // Reinitialize everything
+        void reinitialize();
+      }
+    });
+  }
+
+  // Background color dropdown handler
+  const backgroundColorSelectEl = document.getElementById('backgroundColorSelect');
+  if (backgroundColorSelectEl && backgroundColorSelectEl instanceof HTMLSelectElement) {
+    // Set initial background color
+    canvasManager.setBackgroundColor(backgroundColorSelectEl.value);
+    
+    backgroundColorSelectEl.addEventListener('change', () => {
+      const selectedColor = backgroundColorSelectEl.value;
+      // Update background color immediately (no need to reinitialize)
+      canvasManager.setBackgroundColor(selectedColor);
     });
   }
 };

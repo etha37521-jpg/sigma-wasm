@@ -600,6 +600,103 @@ const result = await imageToTextPipeline(dataUrl);
 - Add defensive fallbacks for edge cases
 - Use pattern matching to make error handling explicit
 
+#### Hexagonal Chunk Neighbor Calculation: Offset Vector Rotation Method
+
+**What We Learned**: Calculating neighbor chunk centers for hexagonal chunk-based systems requires using the correct offset vector rotation method, not simply scaling cube directions by distance. The offset vector `(rings, rings+1)` rotated 60 degrees 6 times ensures chunks tile perfectly without gaps.
+
+**The Mistakes**:
+
+1. **Incorrect Distance Formula**: Initially used `2 * rings` for neighbor distance, which created gaps between chunks when `rings > 0`
+2. **Wrong Approach for rings=0**: Used `distance = 0` which returned the center itself instead of the 6 immediate neighbors
+3. **Cube Direction Scaling**: Attempted to use cube directions scaled by distance, which doesn't produce the correct neighbor positions for chunk packing
+4. **Incorrect Formula Generalization**: Used `Math.max(1, 2 * rings)` which worked for rings=0 but failed for rings=1, showing the formula didn't generalize
+
+**The Impact**:
+- For rings=0: Initially returned only 1 neighbor (the center itself) instead of 6
+- For rings=1: Neighbors at distance 2 created 6 gaps between chunks
+- For rings>1: Would have created even more gaps with incorrect spacing
+- Chunks didn't tile properly, leaving visible gaps in the rendered grid
+- Test failures: "Expected 6 neighbors, got 1" for rings=0, and gap detection failures for rings=1
+
+**The Solutions**:
+
+1. **Use Offset Vector Rotation Method**:
+   ```typescript
+   // CORRECT: Use offset vector (rings, rings+1) rotated 6 times
+   private calculateChunkNeighbors(center: HexCoord, rings: number): Array<HexCoord> {
+     const neighbors: Array<HexCoord> = [];
+     
+     // Base offset vector: (rings, rings+1) for rings>0, or (1, 0) for rings=0
+     let offsetQ: number;
+     let offsetR: number;
+     if (rings === 0) {
+       offsetQ = 1;
+       offsetR = 0;
+     } else {
+       offsetQ = rings;
+       offsetR = rings + 1;
+     }
+     
+     // Rotate the offset vector 60 degrees counter-clockwise 6 times
+     // Rotation formula in axial coordinates: (q, r) -> (-r, q+r)
+     let currentQ = offsetQ;
+     let currentR = offsetR;
+     
+     for (let i = 0; i < 6; i++) {
+       neighbors.push({ q: center.q + currentQ, r: center.r + currentR });
+       
+       // Rotate 60 degrees counter-clockwise
+       const nextQ = -currentR;
+       const nextR = currentQ + currentR;
+       currentQ = nextQ;
+       currentR = nextR;
+     }
+     
+     return neighbors;
+   }
+   ```
+
+2. **Correct Distance Understanding**:
+   - The offset vector `(rings, rings+1)` produces neighbors at distance `2*rings + 1` (or distance 1 for rings=0)
+   - For rings=0: offset `(1, 0)` → distance 1 neighbors
+   - For rings=1: offset `(1, 2)` → distance 3 neighbors
+   - For rings=2: offset `(2, 3)` → distance 5 neighbors
+   - The rotation ensures all 6 neighbors are correctly positioned
+
+3. **Why Cube Direction Scaling Failed**:
+   ```typescript
+   // WRONG: Scaling cube directions doesn't work for chunk packing
+   const distance = 2 * rings + 1;
+   for (const dir of CUBE_DIRECTIONS) {
+     const scaledDir = cube_scale(dir, distance);
+     // This produces neighbors, but not the correct ones for chunk tiling
+   }
+   
+   // CORRECT: Offset vector rotation produces correct neighbors
+   const offset = rings === 0 ? { q: 1, r: 0 } : { q: rings, r: rings + 1 };
+   // Rotate 6 times to get all neighbors
+   ```
+
+**Key Learnings**:
+
+1. **Offset Vector Method**: The offset vector `(rings, rings+1)` rotated 60 degrees counter-clockwise 6 times is the correct method for calculating chunk neighbors in hexagonal grids
+2. **Rotation Formula**: In axial coordinates, 60-degree counter-clockwise rotation is `(q, r) -> (-r, q+r)`
+3. **Distance Formula**: Neighbors are at distance `2*rings + 1` (or 1 for rings=0), but the offset vector method ensures correct positioning
+4. **Generalization**: The offset vector method works for all ring values, not just specific cases
+5. **Chunk Packing**: For chunks to tile without gaps, the outer boundaries must touch, which requires the specific offset vector approach
+
+**Best Practices**:
+- Use offset vector `(rings, rings+1)` rotation method for chunk neighbor calculation
+- Always handle rings=0 as a special case with offset `(1, 0)`
+- Rotate the offset vector 60 degrees counter-clockwise 6 times using `(q, r) -> (-r, q+r)`
+- Test with multiple ring values (0, 1, 2+) to verify the formula generalizes
+- Don't assume cube direction scaling works for all hex grid operations - chunk packing requires the specific offset vector method
+
+**References**:
+- Hexagonal grid chunk packing algorithms
+- Offset vector rotation method for hex grid neighbors
+- Red Blob Games hex grid guide for general hex operations
+
 ---
 
 ### BabylonJS Learnings
@@ -773,6 +870,108 @@ const result = await imageToTextPipeline(dataUrl);
 - Always make base mesh visible when using thin instances
 - Set instance count after setting all buffers
 - Use proper color format (RGBA, 4 components per instance)
+
+#### Coordinate System Handedness: Hex Grid Conversions in BabylonJS
+
+**What We Learned**: BabylonJS uses a left-handed coordinate system by default, which can cause issues when converting hex grid coordinates to world positions if the conversion formulas assume a right-handed system. Understanding and accounting for coordinate system handedness is critical for accurate neighbor calculations and spatial positioning.
+
+**The Problem**:
+- BabylonJS defaults to **left-handed coordinate system**: X points right, Y points up, Z points forward (out of screen)
+- Many hex grid conversion formulas and algorithms assume **right-handed coordinate system**: X points right, Y points up, Z points backward (into screen)
+- When computing chunk neighbor centers, incorrect coordinate system assumptions can lead to:
+  - Neighbors calculated at wrong positions
+  - Hex-to-world conversions producing incorrect world coordinates
+  - Spatial relationships between chunks being misaligned
+
+**Understanding Coordinate System Handedness**:
+
+1. **Left-Handed System (BabylonJS Default)**:
+   - X-axis: Points right (+X)
+   - Y-axis: Points up (+Y)
+   - Z-axis: Points forward (+Z, out of screen)
+   - Right-hand rule: Point thumb right (X), index finger up (Y), middle finger points forward (Z)
+
+2. **Right-Handed System (Common in Many Tools)**:
+   - X-axis: Points right (+X)
+   - Y-axis: Points up (+Y)
+   - Z-axis: Points backward (+Z, into screen)
+   - Right-hand rule: Point thumb right (X), index finger up (Y), middle finger points backward (Z)
+
+**The Impact**:
+- Hex grid neighbor calculations may produce incorrect results
+- Chunk centers may be positioned incorrectly relative to each other
+- Spatial relationships between hex tiles may be inverted or misaligned
+- Neighbor detection algorithms may fail to find adjacent chunks
+
+**Potential Solutions**:
+
+1. **Option 1: Use Right-Handed System in BabylonJS**:
+   ```typescript
+   // Set scene to use right-handed coordinate system
+   scene.useRightHandedSystem = true;
+   ```
+   - **Pros**: Aligns BabylonJS with right-handed hex grid formulas
+   - **Cons**: Some BabylonJS features may behave unexpectedly (billboards, certain shaders)
+   - **Note**: Not all BabylonJS features are fully tested in right-handed mode
+
+2. **Option 2: Negate Z-Axis in hexToWorld Conversion**:
+   ```typescript
+   hexToWorld(q: number, r: number, hexSize: number): { x: number; z: number } {
+     hexSize = hexSize / 1.34;
+     const x = hexSize * (Math.sqrt(3) * 2 * q + Math.sqrt(3) * r);
+     const z = -hexSize * (3 * r); // Negate Z for left-handed system
+     return { x, z };
+   }
+   ```
+   - **Pros**: Keeps BabylonJS in default left-handed mode
+   - **Cons**: Requires careful testing to ensure all conversions are consistent
+   - **Note**: Must also update `worldToHex` to match
+
+3. **Option 3: Verify Hex Neighbor Calculation Logic**:
+   - Ensure hex coordinate neighbor calculations are independent of world coordinate system
+   - Hex coordinates (q, r) are abstract and shouldn't depend on handedness
+   - Only the hex-to-world conversion should account for handedness
+   - Verify that neighbor distance calculations use correct hex distance formulas
+
+**Key Learnings**:
+
+1. **Hex Coordinates vs World Coordinates**:
+   - Hex coordinates (q, r) are abstract and coordinate-system independent
+   - World coordinates (x, y, z) depend on the rendering engine's coordinate system
+   - Neighbor calculations in hex space should be correct regardless of world system
+   - Only the conversion between hex and world coordinates needs to account for handedness
+
+2. **Testing Coordinate Conversions**:
+   - Always test hex-to-world and world-to-hex conversions with known values
+   - Verify that neighbors computed in hex space convert correctly to world space
+   - Check that spatial relationships (adjacency, distance) are preserved
+   - Use visual debugging (axis visualizers) to verify coordinate system orientation
+
+3. **When to Use Right-Handed System**:
+   - Consider using `scene.useRightHandedSystem = true` if:
+     - Hex grid formulas assume right-handed system
+     - Importing models from right-handed tools (Blender, Maya, etc.)
+     - Working with algorithms designed for right-handed systems
+   - Be aware of potential compatibility issues with BabylonJS features
+
+4. **Debugging Coordinate Issues**:
+   - Create axis visualizers to see coordinate system orientation
+   - Log hex coordinates and corresponding world coordinates
+   - Verify neighbor positions visually in the 3D scene
+   - Check that hex distance calculations match world distance calculations
+
+**Best Practices**:
+- Document which coordinate system your hex grid formulas assume
+- Test hex-to-world conversions with known test cases
+- Use visual debugging tools (axis visualizers) to verify coordinate system
+- Consider coordinate system handedness when debugging neighbor calculation issues
+- If using right-handed system, test all BabylonJS features thoroughly
+- Keep hex coordinate calculations separate from world coordinate conversions
+
+**References**:
+- [BabylonJS Coordinate System Documentation](https://doc.babylonjs.com/features/featuresDeepDive/mesh/transforms/center_origin/coordinate_system)
+- [Red Blob Games: Hexagonal Grids](https://www.redblobgames.com/grids/hexagons/) - Comprehensive hex grid guide
+- [BabylonJS Forum: Right-Handed System Discussion](https://forum.babylonjs.com/t/unexpected-behavior-for-z-up-right-handed-coordinate-system/1090)
 
 ---
 
