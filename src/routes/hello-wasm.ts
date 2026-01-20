@@ -403,7 +403,7 @@ export const init = async (): Promise<void> => {
   setouroborosBtn.addEventListener('click', () => {
     if (WASM_HELLO.wasmModule && ouroborosInput) {
       const newouroboros = ouroborosInput.value.trim();
-      if (newouroboros\) {
+      if (newouroboros) {
         WASM_HELLO.wasmModule.set_ouroboros(newouroboros);
         messageDisplay.textContent = WASM_HELLO.wasmModule.get_ouroboros();
         messageInput.value = '';
