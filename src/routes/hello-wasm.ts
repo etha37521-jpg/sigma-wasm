@@ -351,7 +351,7 @@ export const init = async (): Promise<void> => {
   
   if (!counterDisplay || !messageDisplay || 
     !incrementBtn || !messageInputEl || !setMessageBtn ||
-    !ouroborosInputEl || !setouroborosBtn
+    !ouroborosInputEl || !setouroborosBtn 
   ) {
     throw new Error('Required UI elements not found');
   }
