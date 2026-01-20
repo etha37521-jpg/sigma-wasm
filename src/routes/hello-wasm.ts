@@ -29,6 +29,8 @@ let wasmModuleExports: {
   increment_counter: () => void;
   get_message: () => string;
   set_message: (message: string) => void;
+  get_ouroboros: () => string;
+  set_ouroboros: (ouroboros: string) => void;
 } | null = null;
 
 /**
@@ -72,6 +74,12 @@ const getInitWasm = async (): Promise<unknown> => {
       moduleKeys.push('set_message');
     }
     
+    if ('get_ouroboros' in moduleUnknown) {
+      moduleKeys.push('get_ouroboros');
+    }
+    if ('set_ouroboros' in moduleUnknown) {
+      moduleKeys.push('set_ouroboros');
+    }
     // Get all keys for error messages
     const allKeys = Object.keys(moduleUnknown);
     
@@ -95,7 +103,13 @@ const getInitWasm = async (): Promise<unknown> => {
     if (!('set_message' in moduleUnknown) || typeof moduleUnknown.set_message !== 'function') {
       throw new Error(`Module missing 'set_message' export. Available: ${allKeys.join(', ')}`);
     }
-    
+    if (!('get_ouroboros' in moduleUnknown) || typeof moduleUnknown.get_ouroboros !== 'function') {
+      throw new Error(`Module missing 'get_ouroboros' export. Available: ${allKeys.join(', ')}`);
+    }
+    if (!('set_ouroboros' in moduleUnknown) || typeof moduleUnknown.set_ouroboros !== 'function') {
+      throw new Error(`Module missing 'set_ouroboros' export. Available: ${allKeys.join(', ')}`);
+    }
+
     // Extract and assign functions - we've validated they exist and are functions above
     // Access properties directly after validation
     const defaultFunc = moduleUnknown.default;
@@ -104,6 +118,8 @@ const getInitWasm = async (): Promise<unknown> => {
     const incrementCounterFunc = moduleUnknown.increment_counter;
     const getMessageFunc = moduleUnknown.get_message;
     const setMessageFunc = moduleUnknown.set_message;
+    const getouroborosFunc = moduleUnknown.get_ouroboros;
+    const setouroborosFunc = moduleUnknown.set_ouroboros;
     
     if (typeof defaultFunc !== 'function') {
       throw new Error('default export is not a function');
@@ -123,6 +139,12 @@ const getInitWasm = async (): Promise<unknown> => {
     if (typeof setMessageFunc !== 'function') {
       throw new Error('set_message export is not a function');
     }
+      if (typeof getouroborosFunc !== 'function') {
+      throw new Error('get_ouroboros export is not a function');
+    }
+    if (typeof setouroborosFunc !== 'function') {
+      throw new Error('set_ouroboros export is not a function');
+    }
     
     // TypeScript can't narrow Function to specific signatures after validation
     // Runtime validation ensures these are safe
@@ -139,6 +161,10 @@ const getInitWasm = async (): Promise<unknown> => {
       get_message: getMessageFunc as () => string,
       // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
       set_message: setMessageFunc as (message: string) => void,
+      // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+      get_message: getouroborosFunc as () => string,
+      // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+      set_message: setouroborosFunc as (ouroboros: string) => void,
     };
   }
   if (!wasmModuleExports) {
@@ -217,6 +243,12 @@ function validateHelloModule(exports: unknown): WasmModuleHello | null {
     if (typeof wasmModuleExports.set_message !== 'function') {
       missingExports.push('set_message (function)');
     }
+    if (typeof wasmModuleExports.get_ouroboros !== 'function') {
+      missingExports.push('get_ouroboros (function)');
+    }
+    if (typeof wasmModuleExports.set_ouroboros !== 'function') {
+      missingExports.push('set_ouroboros (function)');
+    }
   }
   
   if (missingExports.length > 0) {
@@ -241,7 +273,9 @@ function validateHelloModule(exports: unknown): WasmModuleHello | null {
     increment_counter: wasmModuleExports.increment_counter,
     get_message: wasmModuleExports.get_message,
     set_message: wasmModuleExports.set_message,
-  };
+    get_ouroboros: wasmModuleExports.get_ouroboros,
+    set_ouroboros: wasmModuleExports.set_ouroboros,
+    };
 }
 
 /**
@@ -308,20 +342,33 @@ export const init = async (): Promise<void> => {
   // Get UI elements
   const counterDisplay = document.getElementById('counter-display');
   const messageDisplay = document.getElementById('message-display');
+  const ouroborosDisplay = document.getElementById('ouroboros-display');
   const incrementBtn = document.getElementById('increment-btn');
   const messageInputEl = document.getElementById('message-input');
   const setMessageBtn = document.getElementById('set-message-btn');
+  const ouroborosInputEl = document.getElementById('ouroboros-input');
+  const setouroborosBtn = document.getElementById('set-ouroboros-btn');
   
-  if (!counterDisplay || !messageDisplay || !incrementBtn || !messageInputEl || !setMessageBtn) {
+  if (!counterDisplay || !messageDisplay || 
+    !incrementBtn || !messageInputEl || !setMessageBtn ||
+    !ouroborosInputEl || !setouroborosBtn
+  ) {
     throw new Error('Required UI elements not found');
   }
   
   // Type narrowing for input element
   if (!(messageInputEl instanceof HTMLInputElement)) {
-    throw new Error('message-input element is not an HTMLInputElement');
+    throw new Error('message-imput elemnt is not an HTMLInputElement');
   }
   
   const messageInput = messageInputEl;
+  
+  // Type narrowing for input element
+  if (!(ouroborosInputEl instanceof HTMLInputElement)) {
+    throw new Error('ouroboros-imput elemnt is not an HTMLInputElement');
+  }
+  
+  const ouroborosInput = ouroborosInputEl;
   
   // Update display with initial values
   // **Learning Point**: We call WASM functions directly from TypeScript.
@@ -329,6 +376,7 @@ export const init = async (): Promise<void> => {
   if (WASM_HELLO.wasmModule) {
     counterDisplay.textContent = WASM_HELLO.wasmModule.get_counter().toString();
     messageDisplay.textContent = WASM_HELLO.wasmModule.get_message();
+    ouroborosDisplay.textContent = WASM_HELLO.wasmModule.get_ouroboros();
   }
   
   // Set up event handlers
@@ -352,14 +400,25 @@ export const init = async (): Promise<void> => {
     }
   });
   
-  // Allow Enter key to set message
-  messageInput.addEventListener('keydown', (e: KeyboardEvent) => {
-    if (e.key === 'Enter' && WASM_HELLO.wasmModule) {
-      const newMessage = messageInput.value.trim();
-      if (newMessage) {
-        WASM_HELLO.wasmModule.set_message(newMessage);
-        messageDisplay.textContent = WASM_HELLO.wasmModule.get_message();
+  setouroborosBtn.addEventListener('click', () => {
+    if (WASM_HELLO.wasmModule && ouroborosInput) {
+      const newouroboros = ouroborosInput.value.trim();
+      if (newouroboros\) {
+        WASM_HELLO.wasmModule.set_ouroboros(newouroboros);
+        messageDisplay.textContent = WASM_HELLO.wasmModule.get_ouroboros();
         messageInput.value = '';
+      }
+    }
+  });
+
+  // Allow Enter key to set message
+  ouroborosInput.addEventListener('keydown', (e: KeyboardEvent) => {
+    if (e.key === 'Enter' && WASM_HELLO.wasmModule) {
+      const newouroboros = messageInput.value.trim();
+      if (newouroboros) {
+        WASM_HELLO.wasmModule.set_ouroboros(newouroboros);
+        ouroborosDisplay.textContent = WASM_HELLO.wasmModule.get_ouroboros();
+        ouroborosInput.value = '';
       }
     }
   });

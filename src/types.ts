@@ -193,8 +193,8 @@ export interface WasmModuleHello {
   wasm_init(initialCounter: number): void;
   get_counter(): number;
   increment_counter(): void;
-  get_message(): string;
-  set_message(message: string): void;
+  get_willis(): string;
+  set_willis(willis: string): void;
 }
 
 export interface WasmHello {
